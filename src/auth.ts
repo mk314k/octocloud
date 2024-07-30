@@ -1,8 +1,14 @@
 /**
  * Core GitHub Authentication module (`GitCloudAuth`) in `octocloud`.
+ *
+ * Security-First Defaults:
+ *   1. `oauthScope` defaults to `'public_repo'` (NEVER requests access to private repositories).
+ *   2. Session storage defaults to `'session'` (`sessionStorage`) so tokens are wiped when the tab closes.
+ *   3. Repository Sandbox (`allowedRepos` / `protectedRepos`): prevents accidental writes to non-workspace repos.
  */
 
 export type AuthMode = 'oauth' | 'pat' | 'readonly' | 'none';
+export type StoragePersistence = 'session' | 'local' | 'memory';
 
 export interface GitUserProfile {
   username: string;
@@ -13,9 +19,15 @@ export interface GitUserProfile {
 }
 
 export interface GitAuthOptions {
-  /** Default repository name used for cloud file storage */
+  /** Default repository name used for cloud file storage (e.g. 'AppCloud_Store') */
   defaultRepo?: string;
-  /** Allowed file extensions when listing/filtering repository files */
+  /** Optional allowlist of repository names this app is allowed to write to (defaults to [defaultRepo]) */
+  allowedRepos?: string[];
+  /** Optional list of repository names that must NEVER be written to */
+  protectedRepos?: string[];
+  /** Lock writes strictly to `allowedRepos` (default: false, allows user-chosen workspace repos unless in protectedRepos) */
+  strictRepoSandbox?: boolean;
+  /** Allowed file extensions when listing/filtering repository files (e.g. ['.json', '.md']) */
   extensions?: string[];
   /** GitHub OAuth App Client ID (required only when using loginWithOAuth) */
   oauthClientId?: string;
@@ -23,11 +35,15 @@ export interface GitAuthOptions {
   tokenExchangeUrl?: string;
   /** OAuth redirect URI (defaults to current window.location.origin + pathname) */
   redirectUri?: string;
-  /** OAuth scope */
-  oauthScope?: string;
+  /**
+   * OAuth scope. Defaults to `'public_repo'` so the app NEVER accesses private repositories.
+   */
+  oauthScope?: 'public_repo' | 'repo' | string;
   /** Automatically create the target public repository on login if it does not exist */
   autoCreateRepo?: boolean;
-  /** Storage key name (or false to disable storage) */
+  /** Where to persist session tokens: 'session' (sessionStorage, default), 'local' (localStorage), or 'memory' */
+  persistence?: StoragePersistence;
+  /** Storage key name (or false to force memory-only) */
   storageKey?: string | false;
   /** Optional custom fetch implementation (useful for testing or SSR) */
   fetchImpl?: typeof fetch;
@@ -36,6 +52,7 @@ export interface GitAuthOptions {
 export type AuthStateListener = (profile: GitUserProfile | null) => void;
 
 const DEFAULT_STORAGE_KEY = 'octocloud_auth_session';
+const VALID_REPO_NAME_REGEX = /^[a-zA-Z0-9._-]{1,100}$/;
 
 export class GitCloudAuth {
   public readonly options: Required<Omit<GitAuthOptions, 'storageKey' | 'fetchImpl'>> & {
@@ -55,12 +72,16 @@ export class GitCloudAuth {
 
     this.options = {
       defaultRepo,
+      allowedRepos: options.allowedRepos ?? [defaultRepo],
+      protectedRepos: options.protectedRepos ?? [],
+      strictRepoSandbox: options.strictRepoSandbox ?? false,
       extensions: options.extensions ?? [],
       oauthClientId: options.oauthClientId ?? '',
       tokenExchangeUrl: options.tokenExchangeUrl ?? '',
       redirectUri: options.redirectUri ?? defaultRedirect,
       oauthScope: options.oauthScope ?? 'public_repo',
       autoCreateRepo: options.autoCreateRepo ?? true,
+      persistence: options.persistence ?? 'session',
       storageKey: options.storageKey === undefined ? DEFAULT_STORAGE_KEY : options.storageKey,
       fetchImpl: options.fetchImpl ?? fetch.bind(globalThis),
     };
@@ -69,31 +90,73 @@ export class GitCloudAuth {
     this.restoreSession();
   }
 
+  /** Currently authenticated user profile, or `null` if logged out. */
   public get profile(): GitUserProfile | null {
     return this._profile;
   }
 
+  /** Active GitHub username, or empty string if logged out. */
   public get username(): string {
     return this._profile?.username ?? '';
   }
 
+  /** Active repository name. */
   public get repo(): string {
     return this._repo;
   }
 
+  /**
+   * Validate and set active repository name.
+   * Rejects path traversal characters or invalid repository names.
+   */
   public setRepo(repoName: string): void {
-    this._repo = repoName.trim() || this.options.defaultRepo;
+    const trimmed = repoName.trim() || this.options.defaultRepo;
+    if (!VALID_REPO_NAME_REGEX.test(trimmed) || trimmed === '.' || trimmed === '..') {
+      throw new Error(`Invalid repository name "${trimmed}"`);
+    }
+    this._repo = trimmed;
+    if (!this.options.strictRepoSandbox && !this.options.allowedRepos.includes(trimmed)) {
+      this.options.allowedRepos.push(trimmed);
+    }
     this.saveSession();
   }
 
+  /**
+   * Check whether writing to `repoName` is permitted by the sandbox rules.
+   * Blocks writes to `<username>.github.io` sites and any `protectedRepos`.
+   */
+  public assertWriteAllowed(repoName = this._repo): void {
+    if (!this.hasWriteAccess()) {
+      throw new Error('Write access (OAuth or PAT) is required');
+    }
+    const lower = repoName.toLowerCase();
+    if (lower.endsWith('.github.io')) {
+      throw new Error(`Security Sandbox: Writing to GitHub Pages root repository "${repoName}" is blocked`);
+    }
+    if (this.options.protectedRepos.some((r) => r.toLowerCase() === lower)) {
+      throw new Error(`Security Sandbox: Repository "${repoName}" is protected and read-only`);
+    }
+    if (
+      this.options.strictRepoSandbox &&
+      !this.options.allowedRepos.some((r) => r.toLowerCase() === lower)
+    ) {
+      throw new Error(
+        `Security Sandbox: Repository "${repoName}" is not in the allowedRepos list (${this.options.allowedRepos.join(', ')})`
+      );
+    }
+  }
+
+  /** Current access token (used internally for Authorization headers). */
   public get token(): string {
     return this._token;
   }
 
+  /** Whether the user is currently logged in (any mode). */
   public isAuthenticated(): boolean {
     return this._profile !== null && this._profile.mode !== 'none';
   }
 
+  /** Whether the current session has write permissions (`oauth` or `pat`). */
   public hasWriteAccess(): boolean {
     return (
       this._profile !== null &&
@@ -102,6 +165,7 @@ export class GitCloudAuth {
     );
   }
 
+  /** Build HTTP headers for GitHub API calls. */
   public getHeaders(extra: Record<string, string> = {}): Record<string, string> {
     const headers: Record<string, string> = {
       Accept: 'application/vnd.github.v3+json',
@@ -113,6 +177,7 @@ export class GitCloudAuth {
     return headers;
   }
 
+  /** Subscribe to login/logout state changes. Returns an unsubscribe function. */
   public onAuthStateChange(listener: AuthStateListener): () => void {
     this._listeners.add(listener);
     return () => this._listeners.delete(listener);
@@ -124,6 +189,10 @@ export class GitCloudAuth {
     }
   }
 
+  /**
+   * Mode 1: Authenticate with a GitHub Personal Access Token (Fine-Grained PAT or Classic PAT).
+   * Verifies the token against `https://api.github.com/user` and fetches profile metadata.
+   */
   public async loginWithPAT(token: string, usernameOverride?: string, repoName?: string): Promise<GitUserProfile> {
     const cleanedToken = token.trim();
     if (!cleanedToken) {
@@ -158,6 +227,9 @@ export class GitCloudAuth {
     return this._profile;
   }
 
+  /**
+   * Mode 2: Authenticate in Read-Only mode using a public GitHub username.
+   */
   public async loginReadOnly(username: string, repoName?: string): Promise<GitUserProfile> {
     const cleanedUser = username.trim();
     if (!cleanedUser) {
@@ -190,6 +262,10 @@ export class GitCloudAuth {
     return this._profile;
   }
 
+  /**
+   * Mode 3a: Start the GitHub OAuth Web Flow redirect (using `public_repo` scope by default),
+   * or complete it if `?code=` is already in the URL.
+   */
   public async loginWithOAuth(repoName?: string): Promise<GitUserProfile | null> {
     if (repoName) {
       this.setRepo(repoName);
@@ -216,6 +292,9 @@ export class GitCloudAuth {
     return null;
   }
 
+  /**
+   * Mode 3b: Exchange an OAuth `?code=` query parameter for an access token via `tokenExchangeUrl`.
+   */
   public async handleOAuthCallback(code?: string): Promise<GitUserProfile | null> {
     let oauthCode = code;
     if (!oauthCode && typeof window !== 'undefined') {
@@ -270,34 +349,51 @@ export class GitCloudAuth {
     return this._profile;
   }
 
+  /** Log out and clear stored session. */
   public logout(): void {
     this._profile = null;
     this._token = '';
     this._repo = this.options.defaultRepo;
-    if (this.options.storageKey && typeof sessionStorage !== 'undefined') {
-      sessionStorage.removeItem(this.options.storageKey);
+    const storage = this.getWebStorage();
+    if (this.options.storageKey && storage) {
+      storage.removeItem(this.options.storageKey);
     }
     this.notifyListeners();
   }
 
+  private getWebStorage(): Storage | null {
+    if (!this.options.storageKey || this.options.persistence === 'memory') {
+      return null;
+    }
+    if (this.options.persistence === 'session' && typeof sessionStorage !== 'undefined') {
+      return sessionStorage;
+    }
+    if (this.options.persistence === 'local' && typeof localStorage !== 'undefined') {
+      return localStorage;
+    }
+    return null;
+  }
+
   private saveSession(): void {
-    if (!this.options.storageKey || typeof sessionStorage === 'undefined' || !this._profile) return;
+    const storage = this.getWebStorage();
+    if (!storage || !this.options.storageKey || !this._profile) return;
     try {
       const payload = JSON.stringify({
         profile: this._profile,
         token: this._token,
         repo: this._repo,
       });
-      sessionStorage.setItem(this.options.storageKey, payload);
+      storage.setItem(this.options.storageKey, payload);
     } catch {
       // Ignore storage quota errors
     }
   }
 
   private restoreSession(): void {
-    if (!this.options.storageKey || typeof sessionStorage === 'undefined') return;
+    const storage = this.getWebStorage();
+    if (!storage || !this.options.storageKey) return;
     try {
-      const raw = sessionStorage.getItem(this.options.storageKey);
+      const raw = storage.getItem(this.options.storageKey);
       if (!raw) return;
       const parsed = JSON.parse(raw);
       if (parsed && parsed.profile && parsed.profile.username) {

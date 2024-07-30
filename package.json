@@ -1,7 +1,7 @@
 {
   "name": "octocloud",
-  "version": "0.0.1",
-  "description": "Serverless GitHub Authentication and Cloud Repository Storage SDK for static web apps.",
+  "version": "0.1.0",
+  "description": "Serverless GitHub Authentication, Sandboxed Cloud Repository File Store, and Verified P2P/Repo Multiplayer SDK for GitHub Pages & static web apps.",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -33,14 +33,15 @@
     "github-pages",
     "serverless-storage",
     "cloud-store",
+    "webrtc-multiplayer",
     "oauth",
     "pat"
   ],
   "author": "mk314k",
   "license": "MIT",
   "devDependencies": {
-    "@types/node": "20.4.5",
-    "tsx": "3.12.7",
-    "typescript": "5.1.6"
+    "@types/node": "20.14.13",
+    "tsx": "4.16.2",
+    "typescript": "5.5.4"
   }
 }
