@@ -1,10 +1,15 @@
 /**
  * Serverless Multiplayer SDK for GitHub-Authenticated Web Apps & Games (`src/multiplayer.ts`).
  *
- * Provides `GitPeerRoom` for real-time peer-to-peer WebRTC (`RTCDataChannel`) multiplayer
- * where every packet carries the sender's GitHub identity (`username`, `avatarUrl`) and sequence number.
+ * Security & Session Architecture:
+ *   - Tokens are NEVER transmitted between peers or written to repositories.
+ *   - Each peer generates a unique random `sessionId` and can publish a signed/authenticated
+ *     `SessionProof` to their own public GitHub repository (`rooms/<roomId>.proof.json`).
+ *   - Any peer can call `verifyPeerIdentity()` to read `https://api.github.com/repos/<peerUsername>/<repo>/contents/rooms/<roomId>.proof.json`
+ *     and confirm that the remote player genuinely owns that GitHub account!
  */
 import { GitCloudAuth, GitUserProfile } from './auth';
+import { GitRepoStore } from './store';
 import { encodeBase64UTF8, decodeBase64UTF8 } from './base64';
 
 export interface PlayerIdentity {
@@ -12,6 +17,14 @@ export interface PlayerIdentity {
   name?: string;
   avatarUrl?: string;
   repo?: string;
+}
+
+export interface SessionProof {
+  username: string;
+  repo: string;
+  roomId: string;
+  sessionId: string;
+  issuedAt: number;
 }
 
 export interface MultiplayerMessage<T = unknown> {
@@ -54,7 +67,7 @@ export class GitPeerRoom<T = unknown> {
   private pc: RTCPeerConnection | null = null;
   private channel: RTCDataChannel | null = null;
   private remotePlayer: PlayerIdentity | null = null;
-  protected remoteSessionId: string = '';
+  private remoteSessionId: string = '';
   private msgListeners: Set<MessageListener<T>> = new Set();
   private connListeners: Set<PeerConnectionListener> = new Set();
   private iceServers: RTCIceServer[];
@@ -81,6 +94,52 @@ export class GitPeerRoom<T = unknown> {
 
   public getRemotePlayer(): PlayerIdentity | null {
     return this.remotePlayer;
+  }
+
+  /**
+   * Anti-Spoofing: Publish a proof of this `sessionId` to the local player's GitHub repository
+   * (`rooms/<roomId>.proof.json`). Because only the owner of `<username>` can write to
+   * `<username>/<repo>`, remote peers can fetch this file from GitHub's API to verify identity!
+   */
+  public async publishIdentityProof(store: GitRepoStore): Promise<SessionProof> {
+    const proof: SessionProof = {
+      username: this.auth.username,
+      repo: this.auth.repo,
+      roomId: this.roomId,
+      sessionId: this.sessionId,
+      issuedAt: Date.now(),
+    };
+    await store.writeJSON(`rooms/${this.roomId}.proof.json`, proof, `Publish session proof for ${this.roomId}`);
+    return proof;
+  }
+
+  /**
+   * Anti-Spoofing: Verify that a remote player's `username` and `sessionId` match the proof file
+   * committed inside their public GitHub repository.
+   */
+  public async verifyPeerIdentity(
+    store: GitRepoStore,
+    peerUsername = this.remotePlayer?.username,
+    expectedSessionId = this.remoteSessionId,
+    peerRepo = this.remotePlayer?.repo || this.auth.repo
+  ): Promise<boolean> {
+    if (!peerUsername || !expectedSessionId) {
+      return false;
+    }
+    try {
+      const proof = await store.readJSON<SessionProof>(
+        `rooms/${this.roomId}.proof.json`,
+        peerUsername,
+        peerRepo
+      );
+      return (
+        proof.username.toLowerCase() === peerUsername.toLowerCase() &&
+        proof.roomId === this.roomId &&
+        proof.sessionId === expectedSessionId
+      );
+    } catch {
+      return false;
+    }
   }
 
   public onMessage(listener: MessageListener<T>): () => void {
