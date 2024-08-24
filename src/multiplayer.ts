@@ -7,6 +7,8 @@
  *     `SessionProof` to their own public GitHub repository (`rooms/<roomId>.proof.json`).
  *   - Any peer can call `verifyPeerIdentity()` to read `https://api.github.com/repos/<peerUsername>/<repo>/contents/rooms/<roomId>.proof.json`
  *     and confirm that the remote player genuinely owns that GitHub account!
+ *   - In `GitRepoRoom` (Turn-Based Mode), Dual-Repo Federation allows Player A to write moves
+ *     to `PlayerA/<repo>` while reading opponent moves from `PlayerB/<repo>`—zero shared tokens!
  */
 import { GitCloudAuth, GitUserProfile } from './auth';
 import { GitRepoStore } from './store';
@@ -96,11 +98,6 @@ export class GitPeerRoom<T = unknown> {
     return this.remotePlayer;
   }
 
-  /**
-   * Anti-Spoofing: Publish a proof of this `sessionId` to the local player's GitHub repository
-   * (`rooms/<roomId>.proof.json`). Because only the owner of `<username>` can write to
-   * `<username>/<repo>`, remote peers can fetch this file from GitHub's API to verify identity!
-   */
   public async publishIdentityProof(store: GitRepoStore): Promise<SessionProof> {
     const proof: SessionProof = {
       username: this.auth.username,
@@ -113,10 +110,6 @@ export class GitPeerRoom<T = unknown> {
     return proof;
   }
 
-  /**
-   * Anti-Spoofing: Verify that a remote player's `username` and `sessionId` match the proof file
-   * committed inside their public GitHub repository.
-   */
   public async verifyPeerIdentity(
     store: GitRepoStore,
     peerUsername = this.remotePlayer?.username,
@@ -306,6 +299,165 @@ export class GitPeerRoom<T = unknown> {
     if (this.pc) {
       this.pc.close();
       this.pc = null;
+    }
+  }
+}
+
+export interface SharedMatchState<S = unknown> {
+  roomId: string;
+  players: PlayerIdentity[];
+  turn: string;
+  version: number;
+  state: S;
+  updatedAt: number;
+  history: MultiplayerMessage<unknown>[];
+}
+
+/**
+ * GitHub Repository-Backed Multiplayer Room (`GitRepoRoom`).
+ * Supports both Single-Repo and **Dual-Repo Federated Turn-Based Matches**:
+ *   - Player A writes their moves to `PlayerA/<repo>/rooms/<roomId>.json`.
+ *   - Player B reads `PlayerA/<repo>/rooms/<roomId>.json`, makes a move, and writes to `PlayerB/<repo>/rooms/<roomId>.json`!
+ *   - `getLatestFederatedState([peerUsername])` automatically fetches the highest-version state across all players' public repos without sharing tokens!
+ */
+export class GitRepoRoom<S = unknown> {
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private lastVersion = -1;
+
+  constructor(
+    public readonly store: GitRepoStore,
+    public readonly roomId: string = 'match-1'
+  ) {}
+
+  private get roomFilePath(): string {
+    return `rooms/${this.roomId}.json`;
+  }
+
+  public async createMatch(initialState: S, opponentUsername?: string): Promise<SharedMatchState<S>> {
+    const hostPlayer: PlayerIdentity = {
+      username: this.store.auth.username || 'host',
+      name: this.store.auth.profile?.name,
+      avatarUrl: this.store.auth.profile?.avatarUrl,
+      repo: this.store.auth.repo,
+    };
+
+    const players: PlayerIdentity[] = [hostPlayer];
+    if (opponentUsername) {
+      players.push({ username: opponentUsername.trim(), repo: this.store.auth.repo });
+    }
+
+    const match: SharedMatchState<S> = {
+      roomId: this.roomId,
+      players,
+      turn: hostPlayer.username,
+      version: 1,
+      state: initialState,
+      updatedAt: Date.now(),
+      history: [],
+    };
+
+    await this.store.writeJSON(this.roomFilePath, match, `Create match ${this.roomId}`);
+    this.lastVersion = 1;
+    return match;
+  }
+
+  public async getMatchState(ownerUsername?: string, repoName?: string): Promise<SharedMatchState<S>> {
+    return this.store.readJSON<SharedMatchState<S>>(this.roomFilePath, ownerUsername, repoName);
+  }
+
+  public async getLatestFederatedState(peerUsernames: string[] = []): Promise<SharedMatchState<S>> {
+    const candidates: SharedMatchState<S>[] = [];
+    const owners = Array.from(new Set([this.store.auth.username, ...peerUsernames].filter(Boolean)));
+
+    for (const owner of owners) {
+      try {
+        const state = await this.getMatchState(owner, this.store.auth.repo);
+        if (state && state.roomId === this.roomId) {
+          candidates.push(state);
+        }
+      } catch {
+        // Peer hasn't written their fork of the room file yet
+      }
+    }
+
+    if (candidates.length === 0) {
+      throw new Error(`No match state found for room "${this.roomId}" across [${owners.join(', ')}]`);
+    }
+
+    candidates.sort((a, b) => b.version - a.version || b.updatedAt - a.updatedAt);
+    return candidates[0];
+  }
+
+  public async submitMove(
+    nextState: S,
+    nextTurnUsername?: string,
+    moveAction: unknown = null,
+    peerUsernames: string[] = []
+  ): Promise<SharedMatchState<S>> {
+    const match =
+      peerUsernames.length > 0
+        ? await this.getLatestFederatedState(peerUsernames)
+        : await this.getMatchState();
+
+    const sender: PlayerIdentity = {
+      username: this.store.auth.username || 'player',
+      name: this.store.auth.profile?.name,
+      avatarUrl: this.store.auth.profile?.avatarUrl,
+      repo: this.store.auth.repo,
+    };
+
+    if (!match.players.some((p) => p.username.toLowerCase() === sender.username.toLowerCase())) {
+      match.players.push(sender);
+    }
+
+    match.state = nextState;
+    if (nextTurnUsername) {
+      match.turn = nextTurnUsername;
+    }
+    match.version += 1;
+    match.updatedAt = Date.now();
+    match.history.push({
+      seq: match.version,
+      sessionId: `repo_${this.roomId}`,
+      roomId: this.roomId,
+      type: 'MOVE',
+      sender,
+      payload: moveAction,
+      timestamp: match.updatedAt,
+    });
+
+    await this.store.writeJSON(
+      this.roomFilePath,
+      match,
+      `Move #${match.version} by ${sender.username} in ${this.roomId}`
+    );
+    this.lastVersion = match.version;
+    return match;
+  }
+
+  public startPolling(
+    onUpdate: (match: SharedMatchState<S>) => void,
+    peerUsernames: string[] = [],
+    intervalMs = 3000
+  ): void {
+    this.stopPolling();
+    this.pollTimer = setInterval(async () => {
+      try {
+        const latest = await this.getLatestFederatedState(peerUsernames);
+        if (latest.version > this.lastVersion) {
+          this.lastVersion = latest.version;
+          onUpdate(latest);
+        }
+      } catch {
+        // Ignore transient network errors during polling
+      }
+    }, intervalMs);
+  }
+
+  public stopPolling(): void {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
     }
   }
 }
