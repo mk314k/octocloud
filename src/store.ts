@@ -208,9 +208,19 @@ export class GitRepoStore {
     const cacheKey = `${owner}/${repo}/${cleanPath}`;
 
     const url = `https://api.github.com/repos/${owner}/${repo}/contents/${cleanPath}`;
+    const reqHeaders: Record<string, string> = {};
+    const prevEtag = this.etagCache.get(cacheKey);
+    if (prevEtag && this.contentCache.has(cacheKey)) {
+      reqHeaders['If-None-Match'] = prevEtag;
+    }
+
     const res = await this.auth.options.fetchImpl(url, {
-      headers: this.auth.getHeaders(),
+      headers: this.auth.getHeaders(reqHeaders),
     });
+
+    if (res.status === 304 && this.contentCache.has(cacheKey)) {
+      return this.contentCache.get(cacheKey)!;
+    }
 
     if (!res.ok) {
       throw new Error(`Failed to read file "${cleanPath}" from ${owner}/${repo} (HTTP ${res.status})`);
