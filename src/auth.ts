@@ -1,10 +1,10 @@
 /**
- * Core GitHub Authentication module (`GitCloudAuth`) in `octocloud`.
+ * GitHub authentication (`GitCloudAuth`).
  *
- * Security-First Defaults:
- *   1. `oauthScope` defaults to `'public_repo'` (NEVER requests access to private repositories).
- *   2. Session storage defaults to `'session'` (`sessionStorage`) so tokens are wiped when the tab closes.
- *   3. Repository Sandbox (`allowedRepos` / `protectedRepos`): prevents accidental writes to non-workspace repos.
+ * Defaults:
+ *   - `oauthScope`: `'public_repo'`
+ *   - `persistence`: `'session'` (`sessionStorage`)
+ *   - Repository write sandbox via `allowedRepos` and `protectedRepos`
  */
 
 export type AuthMode = 'oauth' | 'pat' | 'readonly' | 'none';
@@ -19,33 +19,31 @@ export interface GitUserProfile {
 }
 
 export interface GitAuthOptions {
-  /** Default repository name used for cloud file storage (e.g. 'AppCloud_Store') */
+  /** Default repository name used for file storage (default: `'AppCloud_Store'`) */
   defaultRepo?: string;
-  /** Optional allowlist of repository names this app is allowed to write to (defaults to [defaultRepo]) */
+  /** Repository names permitted for write operations (defaults to `[defaultRepo]`) */
   allowedRepos?: string[];
-  /** Optional list of repository names that must NEVER be written to */
+  /** Repository names that are always read-only */
   protectedRepos?: string[];
-  /** Lock writes strictly to `allowedRepos` (default: false, allows user-chosen workspace repos unless in protectedRepos) */
+  /** Restrict writes strictly to `allowedRepos` (default: `false`) */
   strictRepoSandbox?: boolean;
-  /** Allowed file extensions when listing/filtering repository files (e.g. ['.json', '.md']) */
+  /** File extension filter when listing repository files (e.g. `['.json', '.md']`) */
   extensions?: string[];
-  /** GitHub OAuth App Client ID (required only when using loginWithOAuth) */
+  /** GitHub OAuth App Client ID (required for `loginWithOAuth`) */
   oauthClientId?: string;
-  /** OAuth code-to-token exchange endpoint URL (required only when using loginWithOAuth) */
+  /** OAuth code-to-token exchange endpoint URL (required for `loginWithOAuth`) */
   tokenExchangeUrl?: string;
-  /** OAuth redirect URI (defaults to current window.location.origin + pathname) */
+  /** OAuth redirect URI (defaults to `window.location.origin + window.location.pathname`) */
   redirectUri?: string;
-  /**
-   * OAuth scope. Defaults to `'public_repo'` so the app NEVER accesses private repositories.
-   */
+  /** OAuth scope (default: `'public_repo'`) */
   oauthScope?: 'public_repo' | 'repo' | string;
-  /** Automatically create the target public repository on login if it does not exist */
+  /** Create the target public repository on first write/list if it does not exist */
   autoCreateRepo?: boolean;
-  /** Where to persist session tokens: 'session' (sessionStorage, default), 'local' (localStorage), or 'memory' */
+  /** Session storage backend: `'session'` (default), `'local'`, or `'memory'` */
   persistence?: StoragePersistence;
-  /** Storage key name (or false to force memory-only) */
+  /** Storage key name, or `false` to disable storage persistence */
   storageKey?: string | false;
-  /** Optional custom fetch implementation (useful for testing or SSR) */
+  /** Custom `fetch` implementation */
   fetchImpl?: typeof fetch;
 }
 
@@ -90,12 +88,12 @@ export class GitCloudAuth {
     this.restoreSession();
   }
 
-  /** Currently authenticated user profile, or `null` if logged out. */
+  /** Authenticated user profile, or `null` when logged out. */
   public get profile(): GitUserProfile | null {
     return this._profile;
   }
 
-  /** Active GitHub username, or empty string if logged out. */
+  /** Active GitHub username, or empty string when logged out. */
   public get username(): string {
     return this._profile?.username ?? '';
   }
@@ -106,8 +104,7 @@ export class GitCloudAuth {
   }
 
   /**
-   * Validate and set active repository name.
-   * Rejects path traversal characters or invalid repository names.
+   * Validate and set the active repository name.
    */
   public setRepo(repoName: string): void {
     const trimmed = repoName.trim() || this.options.defaultRepo;
@@ -122,8 +119,7 @@ export class GitCloudAuth {
   }
 
   /**
-   * Check whether writing to `repoName` is permitted by the sandbox rules.
-   * Blocks writes to `<username>.github.io` sites and any `protectedRepos`.
+   * Verify that writing to `repoName` is permitted by the sandbox configuration.
    */
   public assertWriteAllowed(repoName = this._repo): void {
     if (!this.hasWriteAccess()) {
@@ -146,17 +142,17 @@ export class GitCloudAuth {
     }
   }
 
-  /** Current access token (used internally for Authorization headers). */
+  /** Access token for `Authorization` headers. */
   public get token(): string {
     return this._token;
   }
 
-  /** Whether the user is currently logged in (any mode). */
+  /** Whether a session is active. */
   public isAuthenticated(): boolean {
     return this._profile !== null && this._profile.mode !== 'none';
   }
 
-  /** Whether the current session has write permissions (`oauth` or `pat`). */
+  /** Whether the active session has write credentials (`oauth` or `pat`). */
   public hasWriteAccess(): boolean {
     return (
       this._profile !== null &&
@@ -165,7 +161,7 @@ export class GitCloudAuth {
     );
   }
 
-  /** Build HTTP headers for GitHub API calls. */
+  /** Build request headers for GitHub API calls. */
   public getHeaders(extra: Record<string, string> = {}): Record<string, string> {
     const headers: Record<string, string> = {
       Accept: 'application/vnd.github.v3+json',
@@ -177,7 +173,7 @@ export class GitCloudAuth {
     return headers;
   }
 
-  /** Subscribe to login/logout state changes. Returns an unsubscribe function. */
+  /** Subscribe to authentication state changes. Returns an unsubscribe function. */
   public onAuthStateChange(listener: AuthStateListener): () => void {
     this._listeners.add(listener);
     return () => this._listeners.delete(listener);
@@ -190,8 +186,7 @@ export class GitCloudAuth {
   }
 
   /**
-   * Mode 1: Authenticate with a GitHub Personal Access Token (Fine-Grained PAT or Classic PAT).
-   * Verifies the token against `https://api.github.com/user` and fetches profile metadata.
+   * Authenticate with a Personal Access Token against `GET /user`.
    */
   public async loginWithPAT(token: string, usernameOverride?: string, repoName?: string): Promise<GitUserProfile> {
     const cleanedToken = token.trim();
@@ -228,7 +223,7 @@ export class GitCloudAuth {
   }
 
   /**
-   * Mode 2: Authenticate in Read-Only mode using a public GitHub username.
+   * Initialize a read-only session for a public GitHub username via `GET /users/:username`.
    */
   public async loginReadOnly(username: string, repoName?: string): Promise<GitUserProfile> {
     const cleanedUser = username.trim();
@@ -263,8 +258,7 @@ export class GitCloudAuth {
   }
 
   /**
-   * Mode 3a: Start the GitHub OAuth Web Flow redirect (using `public_repo` scope by default),
-   * or complete it if `?code=` is already in the URL.
+   * Initiate the GitHub OAuth redirect flow, or complete the callback if `?code=` is present.
    */
   public async loginWithOAuth(repoName?: string): Promise<GitUserProfile | null> {
     if (repoName) {
@@ -293,7 +287,7 @@ export class GitCloudAuth {
   }
 
   /**
-   * Mode 3b: Exchange an OAuth `?code=` query parameter for an access token via `tokenExchangeUrl`.
+   * Exchange an OAuth authorization `code` for an access token via `tokenExchangeUrl`.
    */
   public async handleOAuthCallback(code?: string): Promise<GitUserProfile | null> {
     let oauthCode = code;
@@ -349,7 +343,7 @@ export class GitCloudAuth {
     return this._profile;
   }
 
-  /** Log out and clear stored session. */
+  /** Clear active credentials and remove persisted session state. */
   public logout(): void {
     this._profile = null;
     this._token = '';

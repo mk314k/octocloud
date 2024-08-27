@@ -1,14 +1,10 @@
 /**
- * Serverless Multiplayer SDK for GitHub-Authenticated Web Apps & Games (`src/multiplayer.ts`).
+ * WebRTC P2P (`GitPeerRoom`) and repository-backed turn-based (`GitRepoRoom`) multiplayer rooms.
  *
- * Security & Session Architecture:
- *   - Tokens are NEVER transmitted between peers or written to repositories.
- *   - Each peer generates a unique random `sessionId` and can publish a signed/authenticated
- *     `SessionProof` to their own public GitHub repository (`rooms/<roomId>.proof.json`).
- *   - Any peer can call `verifyPeerIdentity()` to read `https://api.github.com/repos/<peerUsername>/<repo>/contents/rooms/<roomId>.proof.json`
- *     and confirm that the remote player genuinely owns that GitHub account!
- *   - In `GitRepoRoom` (Turn-Based Mode), Dual-Repo Federation allows Player A to write moves
- *     to `PlayerA/<repo>` while reading opponent moves from `PlayerB/<repo>`—zero shared tokens!
+ * - `GitPeerRoom`: exchanges SDP offer/answer tickets and verifies remote peer identity
+ *   against `rooms/<roomId>.proof.json` in the peer's GitHub repository.
+ * - `GitRepoRoom`: synchronizes turn-based state across player repositories (`rooms/<roomId>.json`)
+ *   without sharing access tokens.
  */
 import { GitCloudAuth, GitUserProfile } from './auth';
 import { GitRepoStore } from './store';
@@ -314,11 +310,9 @@ export interface SharedMatchState<S = unknown> {
 }
 
 /**
- * GitHub Repository-Backed Multiplayer Room (`GitRepoRoom`).
- * Supports both Single-Repo and **Dual-Repo Federated Turn-Based Matches**:
- *   - Player A writes their moves to `PlayerA/<repo>/rooms/<roomId>.json`.
- *   - Player B reads `PlayerA/<repo>/rooms/<roomId>.json`, makes a move, and writes to `PlayerB/<repo>/rooms/<roomId>.json`!
- *   - `getLatestFederatedState([peerUsername])` automatically fetches the highest-version state across all players' public repos without sharing tokens!
+ * Repository-backed turn-based room (`GitRepoRoom`).
+ * Reads and writes `rooms/<roomId>.json` across player repositories and resolves
+ * the highest `version` state via `getLatestFederatedState()`.
  */
 export class GitRepoRoom<S = unknown> {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -376,7 +370,7 @@ export class GitRepoRoom<S = unknown> {
           candidates.push(state);
         }
       } catch {
-        // Peer hasn't written their fork of the room file yet
+        // Peer has not written a state file for this room yet
       }
     }
 
