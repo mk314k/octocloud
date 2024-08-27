@@ -1,7 +1,8 @@
 /**
- * Sandboxed Cloud Repository File Store (`GitRepoStore`) in `octocloud`.
- * Turns a GitHub repository into a serverless cloud file & JSON database for static web apps.
- * Enforces path sanitization (blocks `..` traversal) and repository write sandboxing.
+ * Repository file store (`GitRepoStore`).
+ *
+ * Wraps the GitHub Contents API, Git Data Trees API, and raw content CDN
+ * behind path normalization and repository write sandboxing.
  */
 import { GitCloudAuth } from './auth';
 import { encodeBase64UTF8, decodeBase64UTF8 } from './base64';
@@ -19,8 +20,17 @@ export interface LoadedRepoFile extends RepoFileEntry {
   content: string;
 }
 
+export type PublicReadStrategy = 'cdn-first' | 'api';
+
+export interface ReadPublicFileOptions {
+  owner?: string;
+  repo?: string;
+  branch?: string;
+  strategy?: PublicReadStrategy;
+}
+
 /**
- * Sanitize a relative repository file path and reject any `..` traversal attempts.
+ * Normalize a relative repository path and reject `.` or `..` traversal segments.
  */
 export function sanitizeRepoPath(filePath: string): string {
   const cleaned = filePath.trim().replace(/^\/+|\/+$/g, '');
@@ -36,19 +46,43 @@ export function sanitizeRepoPath(filePath: string): string {
   return cleaned;
 }
 
+export interface PullRequestProposalResult {
+  prNumber: number;
+  prUrl: string;
+  forkOwner: string;
+  branch: string;
+  path: string;
+  sha: string;
+}
+
+export interface BatchFileChange {
+  path: string;
+  /** UTF-8 file content, or `null` to remove the path from the Git tree */
+  content: string | null;
+}
+
+export interface BatchCommitResult {
+  commitSha: string;
+  treeSha: string;
+  branch: string;
+  fileCount: number;
+}
+
 export class GitRepoStore {
   private shaCache: Map<string, string> = new Map();
   private contentCache: Map<string, string> = new Map();
+  private etagCache: Map<string, string> = new Map();
 
   constructor(public readonly auth: GitCloudAuth) {}
 
-  /** Clear cached file contents and SHAs. */
+  /** Clear cached file contents, ETags, and blob SHAs. */
   public clearCache(): void {
     this.shaCache.clear();
     this.contentCache.clear();
+    this.etagCache.clear();
   }
 
-  /** Check whether a filename matches the configured `extensions` filter (if any). */
+  /** Check whether `filename` matches the configured extension filter. */
   public matchesExtension(filename: string): boolean {
     const exts = this.auth.options.extensions;
     if (!exts || exts.length === 0) {
@@ -62,8 +96,8 @@ export class GitRepoStore {
   }
 
   /**
-   * Ensure the active repository exists. If missing and `autoCreateRepo` is enabled
-   * (with write access), creates the repository automatically as a public workspace repo.
+   * Check whether the active repository exists, creating it if `autoCreateRepo`
+   * is enabled and the session has write permissions.
    */
   public async ensureRepo(): Promise<boolean> {
     if (!this.auth.username || !this.auth.repo) {
@@ -87,7 +121,7 @@ export class GitRepoStore {
     return false;
   }
 
-  /** Create a new public GitHub repository under the authenticated user's account. */
+  /** Create a public repository under the authenticated user's account. */
   public async createRepo(repoName = this.auth.repo): Promise<void> {
     this.auth.setRepo(repoName);
     this.auth.assertWriteAllowed(this.auth.repo);
@@ -108,7 +142,7 @@ export class GitRepoStore {
   }
 
   /**
-   * List files in the repository directory (filtered by `options.extensions` if configured).
+   * List files in a repository directory, filtered by `options.extensions` when set.
    */
   public async listFiles(dirPath = '', ownerOverride?: string, repoOverride?: string): Promise<RepoFileEntry[]> {
     const owner = ownerOverride || this.auth.username;
@@ -164,7 +198,8 @@ export class GitRepoStore {
   }
 
   /**
-   * Read a UTF-8 text file from the user's repository (or another user's public repository when `ownerOverride` is given).
+   * Read a UTF-8 file from the repository via the Contents API.
+   * Uses `If-None-Match` when a cached `ETag` is available.
    */
   public async readFile(filePath: string, ownerOverride?: string, repoOverride?: string): Promise<string> {
     const owner = ownerOverride || this.auth.username;
@@ -181,6 +216,11 @@ export class GitRepoStore {
       throw new Error(`Failed to read file "${cleanPath}" from ${owner}/${repo} (HTTP ${res.status})`);
     }
 
+    const etag = res.headers?.get?.('ETag') || res.headers?.get?.('etag');
+    if (etag) {
+      this.etagCache.set(cacheKey, etag);
+    }
+
     const data = await res.json();
     if (data.sha) {
       this.shaCache.set(cacheKey, data.sha);
@@ -191,7 +231,48 @@ export class GitRepoStore {
   }
 
   /**
-   * Fetch all matching files and their decoded contents from the repository directory.
+   * Read a public file from `raw.githubusercontent.com` first, falling back to
+   * the REST Contents API if the raw fetch fails.
+   */
+  public async readPublicFile(filePath: string, options: ReadPublicFileOptions = {}): Promise<string> {
+    const owner = options.owner || this.auth.username;
+    const repo = options.repo || this.auth.repo;
+    const branch = options.branch || 'main';
+    const strategy = options.strategy || 'cdn-first';
+    if (!owner || !repo) {
+      throw new Error('Owner and repository name are required for readPublicFile()');
+    }
+
+    const cleanPath = sanitizeRepoPath(filePath);
+    const cacheKey = `${owner}/${repo}/${cleanPath}`;
+
+    if (strategy === 'cdn-first') {
+      const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${cleanPath}`;
+      try {
+        const rawRes = await this.auth.options.fetchImpl(rawUrl);
+        if (rawRes.ok) {
+          const text = await rawRes.text();
+          this.contentCache.set(cacheKey, text);
+          return text;
+        }
+      } catch {
+        // Fall through to Contents API
+      }
+    }
+
+    return this.readFile(cleanPath, owner, repo);
+  }
+
+  /**
+   * Read and parse a public JSON file via `readPublicFile`.
+   */
+  public async readPublicJSON<T = unknown>(filePath: string, options: ReadPublicFileOptions = {}): Promise<T> {
+    const raw = await this.readPublicFile(filePath, options);
+    return JSON.parse(raw) as T;
+  }
+
+  /**
+   * Read all matching files in `dirPath` and return a `Map<filename, content>`.
    */
   public async fetchAllFiles(dirPath = ''): Promise<Map<string, string>> {
     const entries = await this.listFiles(dirPath);
@@ -204,8 +285,8 @@ export class GitRepoStore {
   }
 
   /**
-   * Create or update a file in the authenticated user's sandboxed workspace repository.
-   * Automatically resolves the existing file blob `sha` if updating an existing file.
+   * Create or update a file in the active workspace repository.
+   * Resolves the existing blob SHA automatically and retries once on HTTP 409/422.
    */
   public async writeFile(
     filePath: string,
@@ -240,7 +321,7 @@ export class GitRepoStore {
     }
 
     const putUrl = `https://api.github.com/repos/${this.auth.username}/${this.auth.repo}/contents/${cleanPath}`;
-    const res = await this.auth.options.fetchImpl(putUrl, {
+    let res = await this.auth.options.fetchImpl(putUrl, {
       method: 'PUT',
       headers: this.auth.getHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload),
@@ -260,7 +341,7 @@ export class GitRepoStore {
   }
 
   /**
-   * Delete a file from the authenticated user's sandboxed workspace repository.
+   * Delete a file from the active workspace repository.
    */
   public async deleteFile(filePath: string, commitMessage?: string): Promise<void> {
     this.auth.assertWriteAllowed(this.auth.repo);
@@ -294,13 +375,13 @@ export class GitRepoStore {
     this.contentCache.delete(cacheKey);
   }
 
-  /** Convenience helper to read and parse a JSON file from a repository. */
+  /** Read and parse a JSON file from a repository. */
   public async readJSON<T = unknown>(filePath: string, ownerOverride?: string, repoOverride?: string): Promise<T> {
     const raw = await this.readFile(filePath, ownerOverride, repoOverride);
     return JSON.parse(raw) as T;
   }
 
-  /** Convenience helper to serialize and write a JSON object to the authenticated user's repository. */
+  /** Serialize and write a JSON value to the active workspace repository. */
   public async writeJSON<T = unknown>(
     filePath: string,
     data: T,
@@ -309,4 +390,5 @@ export class GitRepoStore {
     const formatted = JSON.stringify(data, null, 2);
     return this.writeFile(filePath, formatted, commitMessage);
   }
+
 }
