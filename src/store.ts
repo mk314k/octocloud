@@ -337,6 +337,24 @@ export class GitRepoStore {
       body: JSON.stringify(payload),
     });
 
+    if (res.status === 409 || res.status === 422) {
+      const refreshRes = await this.auth.options.fetchImpl(putUrl, {
+        headers: this.auth.getHeaders(),
+      });
+      if (refreshRes.status === 200) {
+        const latest = await refreshRes.json();
+        if (latest.sha) {
+          payload.sha = latest.sha;
+          this.shaCache.set(cacheKey, latest.sha);
+          res = await this.auth.options.fetchImpl(putUrl, {
+            method: 'PUT',
+            headers: this.auth.getHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify(payload),
+          });
+        }
+      }
+    }
+
     if (!res.ok) {
       throw new Error(`Failed to write file "${cleanPath}" (HTTP ${res.status})`);
     }
