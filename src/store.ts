@@ -419,4 +419,85 @@ export class GitRepoStore {
     return this.writeFile(filePath, formatted, commitMessage);
   }
 
+  /**
+   * Fork an upstream repository, commit a file to a branch on the fork,
+   * and open a pull request against `upstreamOwner/upstreamRepo`.
+   */
+  public async proposeFileChangeViaPR(options: {
+    upstreamOwner: string;
+    upstreamRepo: string;
+    filePath: string;
+    content: string;
+    title: string;
+    body?: string;
+    baseBranch?: string;
+    headBranch?: string;
+  }): Promise<PullRequestProposalResult> {
+    if (!this.auth.hasWriteAccess() || !this.auth.username) {
+      throw new Error('Authenticated write session is required to propose a Pull Request');
+    }
+
+    const cleanPath = sanitizeRepoPath(options.filePath);
+    const baseBranch = options.baseBranch || 'main';
+    const headBranch = options.headBranch || `octocloud-patch-${Date.now()}`;
+    const forkOwner = this.auth.username;
+
+    const forkRes = await this.auth.options.fetchImpl(
+      `https://api.github.com/repos/${options.upstreamOwner}/${options.upstreamRepo}/forks`,
+      {
+        method: 'POST',
+        headers: this.auth.getHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({}),
+      }
+    );
+    if (!forkRes.ok && forkRes.status !== 202 && forkRes.status !== 200) {
+      throw new Error(`Failed to create fork for ${options.upstreamOwner}/${options.upstreamRepo} (HTTP ${forkRes.status})`);
+    }
+
+    const putUrl = `https://api.github.com/repos/${forkOwner}/${options.upstreamRepo}/contents/${cleanPath}`;
+    const putRes = await this.auth.options.fetchImpl(putUrl, {
+      method: 'PUT',
+      headers: this.auth.getHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        message: options.title,
+        content: encodeBase64UTF8(options.content),
+        branch: headBranch,
+      }),
+    });
+
+    if (!putRes.ok) {
+      throw new Error(`Failed to write proposed file to fork ${forkOwner}/${options.upstreamRepo} (HTTP ${putRes.status})`);
+    }
+    const putData = await putRes.json();
+    const newSha: string = putData?.content?.sha || '';
+
+    const prRes = await this.auth.options.fetchImpl(
+      `https://api.github.com/repos/${options.upstreamOwner}/${options.upstreamRepo}/pulls`,
+      {
+        method: 'POST',
+        headers: this.auth.getHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          title: options.title,
+          body: options.body || `Proposed via octocloud by @${forkOwner}`,
+          head: `${forkOwner}:${headBranch}`,
+          base: baseBranch,
+        }),
+      }
+    );
+
+    if (!prRes.ok) {
+      throw new Error(`Failed to open Pull Request on ${options.upstreamOwner}/${options.upstreamRepo} (HTTP ${prRes.status})`);
+    }
+    const prData = await prRes.json();
+
+    return {
+      prNumber: prData.number ?? 1,
+      prUrl: prData.html_url || '',
+      forkOwner,
+      branch: headBranch,
+      path: cleanPath,
+      sha: newSha,
+    };
+  }
+
 }
