@@ -317,6 +317,34 @@ export class GitTable<Row extends TableRow = TableRow> {
   }
 
   /**
+   * Query and merge rows across multiple repository owners in parallel.
+   * Rows sharing the same `id` are deduplicated by highest `updatedAt`.
+   */
+  public async federatedSelect(
+    owners: string[],
+    query: SelectQuery<Row> = {},
+    repoOverride = this.options.repoOverride || this.store.auth.repo
+  ): Promise<Array<Row & { _similarity?: number }>> {
+    const uniqueOwners = Array.from(new Set(owners.map((o) => o.trim()).filter(Boolean)));
+    const perOwnerLists = await Promise.all(
+      uniqueOwners.map((owner) => this.loadAllRows(owner, repoOverride).catch(() => [] as Row[]))
+    );
+
+    const mergedById = new Map<string, Row>();
+    for (const list of perOwnerLists) {
+      for (const row of list) {
+        if (!row || typeof row.id !== 'string') continue;
+        const prev = mergedById.get(row.id);
+        if (!prev || (row.updatedAt ?? 0) >= (prev.updatedAt ?? 0)) {
+          mergedById.set(row.id, row);
+        }
+      }
+    }
+
+    return this.applyQueryPipeline(Array.from(mergedById.values()), query);
+  }
+
+  /**
    * Update an existing row by `id`. Enforces row ownership when `enforceRowOwnership` is enabled.
    */
   public async update(id: string, patch: Partial<Row>): Promise<Row | null> {
