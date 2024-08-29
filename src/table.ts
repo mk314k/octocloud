@@ -21,8 +21,20 @@ export interface TableRow {
   [key: string]: unknown;
 }
 
+export interface VectorSimilarityClause<Row extends TableRow> {
+  /** Row property containing a `number[]` embedding */
+  field: keyof Row;
+  /** Query vector (`number[]`) */
+  vector: number[];
+  /** Minimum cosine similarity in [-1, 1] (default: 0.5) */
+  threshold?: number;
+  /** Maximum number of matches to return */
+  topK?: number;
+}
+
 export interface SelectQuery<Row extends TableRow> {
   where?: (row: Row) => boolean;
+  similarity?: VectorSimilarityClause<Row>;
   orderBy?: keyof Row;
   desc?: boolean;
   limit?: number;
@@ -45,6 +57,30 @@ export interface GitTableOptions {
   ownerOverride?: string;
   /** Optional repository name override */
   repoOverride?: string;
+}
+
+/**
+ * Cosine similarity in [-1, 1] between two numeric vectors.
+ * Returns 0 for empty, unequal-length, or zero-norm inputs.
+ */
+export function cosineSimilarity(vecA: readonly number[], vecB: readonly number[]): number {
+  if (!Array.isArray(vecA) || !Array.isArray(vecB) || vecA.length === 0 || vecA.length !== vecB.length) {
+    return 0;
+  }
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < vecA.length; i++) {
+    const a = vecA[i];
+    const b = vecB[i];
+    dot += a * b;
+    normA += a * a;
+    normB += b * b;
+  }
+  if (normA === 0 || normB === 0) {
+    return 0;
+  }
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
 export class GitTable<Row extends TableRow = TableRow> {
