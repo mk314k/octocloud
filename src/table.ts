@@ -1,15 +1,10 @@
 /**
- * Serverless Relational / Collection Table Engine (`GitTable<Row>`) in `octocloud`.
+ * Structured table storage (`GitTable<Row>`) backed by GitHub repository JSON files.
  *
- * Allows static web apps and games to store structured relational tables inside a GitHub repository
- * (`tables/<tableName>.json` or row-sharded `tables/<tableName>/rows/<id>.json`).
- *
- * Supports:
- *   - `insert`, `upsert`, `findById`, `select` (`where`, `orderBy`, `desc`, `limit`, `offset`)
- *   - `update`, `delete`
- *   - Row-Level Ownership (`enforceRowOwnership: true` stamps `owner` with the authenticated GitHub username
- *     and prevents users from modifying or deleting rows owned by someone else)
- *   - `innerJoin` across two `GitTable` instances
+ * Supports three storage layouts:
+ *   - `'collection'`: single `tables/<tableName>.json` file.
+ *   - `'sharded'`: one file per row under `tables/<tableName>/rows/<id>.json`.
+ *   - `'indexed-sharded'`: per-row files plus a compacted `tables/<tableName>.index.json` snapshot.
  */
 import { GitRepoStore, sanitizeRepoPath } from './store';
 
@@ -44,16 +39,17 @@ export interface SelectQuery<Row extends TableRow> {
 export interface GitTableOptions {
   /**
    * Storage layout:
-   * - `'collection'` (default): stores all rows in `tables/<tableName>.json` (fast single-fetch reads)
-   * - `'sharded'`: stores each row in its own file `tables/<tableName>/rows/<id>.json` (avoids multi-user write conflicts!)
+   * - `'collection'` (default): stores all rows in `tables/<tableName>.json`
+   * - `'sharded'`: stores each row in `tables/<tableName>/rows/<id>.json`
+   * - `'indexed-sharded'`: writes per-row files and maintains `tables/<tableName>.index.json`
    */
-  storageMode?: 'collection' | 'sharded';
+  storageMode?: 'collection' | 'sharded' | 'indexed-sharded';
   /**
-   * When true, stamps `row.owner = auth.username` on insert and blocks updates/deletes
-   * if `existingRow.owner !== auth.username`.
+   * Stamp `row.owner = auth.username` on insert and reject updates/deletes
+   * when `existingRow.owner !== auth.username`.
    */
   enforceRowOwnership?: boolean;
-  /** Optional repository owner override (for reading public shared tables hosted by the app developer) */
+  /** Optional repository owner override for reading public tables */
   ownerOverride?: string;
   /** Optional repository name override */
   repoOverride?: string;
@@ -109,40 +105,56 @@ export class GitTable<Row extends TableRow = TableRow> {
     return `tables/${this.tableName}.json`;
   }
 
+  private get indexPath(): string {
+    return `tables/${this.tableName}.index.json`;
+  }
+
   private getRowPath(id: string): string {
     const safeId = sanitizeRepoPath(id).replace(/\//g, '_');
     return `tables/${this.tableName}/rows/${safeId}.json`;
   }
 
-  private async loadAllRows(): Promise<Row[]> {
-    if (this.options.storageMode === 'sharded') {
+  private async loadShardedRowsFromOwner(ownerOverride?: string, repoOverride?: string): Promise<Row[]> {
+    try {
+      const entries = await this.store.listFiles(
+        `tables/${this.tableName}/rows`,
+        ownerOverride,
+        repoOverride
+      );
+      const jsonEntries = entries.filter((entry) => entry.name.endsWith('.json'));
+      const rows: Array<Row | null> = await Promise.all(
+        jsonEntries.map((entry) =>
+          this.store.readJSON<Row>(entry.path, ownerOverride, repoOverride).catch(() => null)
+        )
+      );
+      return rows.filter((r): r is Row => r !== null);
+    } catch {
+      return [];
+    }
+  }
+
+  private async loadAllRows(ownerOverride = this.options.ownerOverride, repoOverride = this.options.repoOverride): Promise<Row[]> {
+    if (this.options.storageMode === 'indexed-sharded') {
       try {
-        const entries = await this.store.listFiles(
-          `tables/${this.tableName}/rows`,
-          this.options.ownerOverride,
-          this.options.repoOverride
-        );
-        const jsonEntries = entries.filter((entry) => entry.name.endsWith('.json'));
-        const rows: Array<Row | null> = await Promise.all(
-          jsonEntries.map((entry) =>
-            this.store.readJSON<Row>(
-              entry.path,
-              this.options.ownerOverride,
-              this.options.repoOverride
-            ).catch(() => null)
-          )
-        );
-        return rows.filter((r): r is Row => r !== null);
+        const indexed = await this.store.readJSON<Row[]>(this.indexPath, ownerOverride, repoOverride);
+        if (Array.isArray(indexed)) {
+          return indexed;
+        }
       } catch {
-        return [];
+        // Fall back to reading row directory if index file is not present
       }
+      return this.loadShardedRowsFromOwner(ownerOverride, repoOverride);
+    }
+
+    if (this.options.storageMode === 'sharded') {
+      return this.loadShardedRowsFromOwner(ownerOverride, repoOverride);
     }
 
     try {
       const rows = await this.store.readJSON<Row[]>(
         this.collectionPath,
-        this.options.ownerOverride,
-        this.options.repoOverride
+        ownerOverride,
+        repoOverride
       );
       return Array.isArray(rows) ? rows : [];
     } catch {
@@ -152,6 +164,15 @@ export class GitTable<Row extends TableRow = TableRow> {
 
   private async saveCollectionRows(rows: Row[], message: string): Promise<void> {
     await this.store.writeJSON(this.collectionPath, rows, message);
+  }
+
+  /**
+   * Rebuild `tables/<tableName>.index.json` from all sharded row files.
+   */
+  public async compactIndex(): Promise<Row[]> {
+    const rows = await this.loadShardedRowsFromOwner(this.options.ownerOverride, this.options.repoOverride);
+    await this.store.writeJSON(this.indexPath, rows, `Compact index for ${this.tableName}`);
+    return rows;
   }
 
   private assertOwnershipPermission(existingRow: Row): void {
@@ -168,8 +189,12 @@ export class GitTable<Row extends TableRow = TableRow> {
     }
   }
 
+  private get isShardedWrite(): boolean {
+    return this.options.storageMode === 'sharded' || this.options.storageMode === 'indexed-sharded';
+  }
+
   /**
-   * Insert a new row into the table. Throws if a row with the same `id` already exists.
+   * Insert a new row. Throws if a row with the same `id` already exists.
    */
   public async insert(row: Row): Promise<Row> {
     if (!row.id || typeof row.id !== 'string') {
@@ -186,7 +211,7 @@ export class GitTable<Row extends TableRow = TableRow> {
       updatedAt: now,
     };
 
-    if (this.options.storageMode === 'sharded') {
+    if (this.isShardedWrite) {
       const existing = await this.findById(row.id);
       if (existing) {
         throw new Error(`Row with id "${row.id}" already exists in table "${this.tableName}"`);
@@ -196,6 +221,9 @@ export class GitTable<Row extends TableRow = TableRow> {
         stamped,
         `Insert row ${row.id} into ${this.tableName}`
       );
+      if (this.options.storageMode === 'indexed-sharded') {
+        await this.compactIndex();
+      }
       return stamped;
     }
 
@@ -209,7 +237,7 @@ export class GitTable<Row extends TableRow = TableRow> {
   }
 
   /**
-   * Insert or update a row in the table (`upsert`).
+   * Insert or update a row by `id`.
    */
   public async upsert(row: Row): Promise<Row> {
     const existing = await this.findById(row.id);
@@ -221,10 +249,10 @@ export class GitTable<Row extends TableRow = TableRow> {
   }
 
   /**
-   * Find a single row by its primary `id`.
+   * Look up a single row by primary `id`.
    */
   public async findById(id: string): Promise<Row | null> {
-    if (this.options.storageMode === 'sharded') {
+    if (this.isShardedWrite) {
       try {
         return await this.store.readJSON<Row>(
           this.getRowPath(id),
@@ -240,20 +268,33 @@ export class GitTable<Row extends TableRow = TableRow> {
     return rows.find((r) => r.id === id) ?? null;
   }
 
-  /**
-   * Query rows from the table using optional `where`, `orderBy`, `desc`, `offset`, and `limit` clauses.
-   */
-  public async select(query: SelectQuery<Row> = {}): Promise<Row[]> {
-    let rows = await this.loadAllRows();
+  private applyQueryPipeline(rows: Row[], query: SelectQuery<Row>): Array<Row & { _similarity?: number }> {
+    let result: Array<Row & { _similarity?: number }> = [...rows];
 
     if (query.where) {
-      rows = rows.filter(query.where);
+      result = result.filter(query.where);
+    }
+
+    if (query.similarity) {
+      const { field, vector, threshold = 0.5, topK } = query.similarity;
+      const scored: Array<Row & { _similarity: number }> = [];
+      for (const row of result) {
+        const candidateVec = row[field];
+        if (Array.isArray(candidateVec)) {
+          const sim = cosineSimilarity(vector, candidateVec as number[]);
+          if (sim >= threshold) {
+            scored.push({ ...row, _similarity: sim });
+          }
+        }
+      }
+      scored.sort((a, b) => b._similarity - a._similarity);
+      result = topK !== undefined ? scored.slice(0, topK) : scored;
     }
 
     if (query.orderBy !== undefined) {
       const key = query.orderBy;
       const dir = query.desc ? -1 : 1;
-      rows = [...rows].sort((a, b) => {
+      result = [...result].sort((a, b) => {
         const va = a[key] as string | number;
         const vb = b[key] as string | number;
         if (va < vb) return -1 * dir;
@@ -264,14 +305,22 @@ export class GitTable<Row extends TableRow = TableRow> {
 
     const start = query.offset ?? 0;
     const end = query.limit !== undefined ? start + query.limit : undefined;
-    return rows.slice(start, end);
+    return result.slice(start, end);
   }
 
   /**
-   * Update an existing row by `id`. Respects `enforceRowOwnership` if enabled.
+   * Query rows using optional `where`, `similarity`, `orderBy`, `desc`, `offset`, and `limit` clauses.
+   */
+  public async select(query: SelectQuery<Row> = {}): Promise<Array<Row & { _similarity?: number }>> {
+    const rows = await this.loadAllRows();
+    return this.applyQueryPipeline(rows, query);
+  }
+
+  /**
+   * Update an existing row by `id`. Enforces row ownership when `enforceRowOwnership` is enabled.
    */
   public async update(id: string, patch: Partial<Row>): Promise<Row | null> {
-    if (this.options.storageMode === 'sharded') {
+    if (this.isShardedWrite) {
       const existing = await this.findById(id);
       if (!existing) return null;
       this.assertOwnershipPermission(existing);
@@ -288,14 +337,17 @@ export class GitTable<Row extends TableRow = TableRow> {
         updated,
         `Update row ${id} in ${this.tableName}`
       );
+      if (this.options.storageMode === 'indexed-sharded') {
+        await this.compactIndex();
+      }
       return updated;
     }
 
     const rows = await this.loadAllRows();
-    const idx = rows.findIndex((r) => r.id === id);
-    if (idx === -1) return null;
+    const index = rows.findIndex((r) => r.id === id);
+    if (index === -1) return null;
 
-    const existing = rows[idx];
+    const existing = rows[index];
     this.assertOwnershipPermission(existing);
 
     const updated: Row = {
@@ -305,61 +357,58 @@ export class GitTable<Row extends TableRow = TableRow> {
       owner: existing.owner,
       updatedAt: Date.now(),
     };
-    rows[idx] = updated;
+    rows[index] = updated;
     await this.saveCollectionRows(rows, `Update row ${id} in ${this.tableName}`);
     return updated;
   }
 
   /**
-   * Delete a row by `id`. Respects `enforceRowOwnership` if enabled.
+   * Delete a row by `id`. Enforces row ownership when `enforceRowOwnership` is enabled.
    */
   public async delete(id: string): Promise<boolean> {
-    if (this.options.storageMode === 'sharded') {
+    if (this.isShardedWrite) {
       const existing = await this.findById(id);
       if (!existing) return false;
       this.assertOwnershipPermission(existing);
-      await this.store.deleteFile(this.getRowPath(id), `Delete row ${id} from ${this.tableName}`);
+      await this.store.deleteFile(
+        this.getRowPath(id),
+        `Delete row ${id} from ${this.tableName}`
+      );
+      if (this.options.storageMode === 'indexed-sharded') {
+        await this.compactIndex();
+      }
       return true;
     }
 
     const rows = await this.loadAllRows();
-    const idx = rows.findIndex((r) => r.id === id);
-    if (idx === -1) return false;
+    const index = rows.findIndex((r) => r.id === id);
+    if (index === -1) return false;
 
-    this.assertOwnershipPermission(rows[idx]);
-    rows.splice(idx, 1);
+    this.assertOwnershipPermission(rows[index]);
+    rows.splice(index, 1);
     await this.saveCollectionRows(rows, `Delete row ${id} from ${this.tableName}`);
     return true;
   }
 
   /**
-   * Perform an in-memory relational INNER JOIN with another `GitTable` on matching keys.
+   * Inner join between this table and `otherTable` on `localKey === foreignKey`.
    */
-  public async innerJoin<OtherRow extends TableRow, Result = { left: Row; right: OtherRow }>(
+  public async innerJoin<OtherRow extends TableRow, Joined>(
     otherTable: GitTable<OtherRow>,
-    leftKey: keyof Row,
-    rightKey: keyof OtherRow,
-    project?: (left: Row, right: OtherRow) => Result
-  ): Promise<Result[]> {
-    const [leftRows, rightRows] = await Promise.all([
+    localKey: keyof Row,
+    foreignKey: keyof OtherRow,
+    selectJoined: (localRow: Row, otherRow: OtherRow) => Joined
+  ): Promise<Joined[]> {
+    const [localRows, otherRows] = await Promise.all([
       this.select(),
       otherTable.select(),
     ]);
 
-    const rightIndex = new Map<unknown, OtherRow[]>();
-    for (const r of rightRows) {
-      const k = r[rightKey];
-      const bucket = rightIndex.get(k) ?? [];
-      bucket.push(r);
-      rightIndex.set(k, bucket);
-    }
-
-    const results: Result[] = [];
-    for (const l of leftRows) {
-      const matches = rightIndex.get(l[leftKey]);
-      if (matches) {
-        for (const r of matches) {
-          results.push(project ? project(l, r) : ({ left: l, right: r } as unknown as Result));
+    const results: Joined[] = [];
+    for (const lRow of localRows) {
+      for (const oRow of otherRows) {
+        if (lRow[localKey] !== undefined && lRow[localKey] === oRow[foreignKey]) {
+          results.push(selectJoined(lRow, oRow));
         }
       }
     }
