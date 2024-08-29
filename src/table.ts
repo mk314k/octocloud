@@ -122,18 +122,17 @@ export class GitTable<Row extends TableRow = TableRow> {
           this.options.ownerOverride,
           this.options.repoOverride
         );
-        const rows: Row[] = [];
-        for (const entry of entries) {
-          if (entry.name.endsWith('.json')) {
-            const row = await this.store.readJSON<Row>(
+        const jsonEntries = entries.filter((entry) => entry.name.endsWith('.json'));
+        const rows: Array<Row | null> = await Promise.all(
+          jsonEntries.map((entry) =>
+            this.store.readJSON<Row>(
               entry.path,
               this.options.ownerOverride,
               this.options.repoOverride
-            );
-            rows.push(row);
-          }
-        }
-        return rows;
+            ).catch(() => null)
+          )
+        );
+        return rows.filter((r): r is Row => r !== null);
       } catch {
         return [];
       }
