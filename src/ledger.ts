@@ -87,3 +87,92 @@ export async function sha256Hex(input: string): Promise<string> {
   return bytesToHex(new Uint8Array(digest));
 }
 
+/**
+ * Generate an extractable WebCrypto ECDSA P-256 keypair.
+ */
+export async function generateLedgerKeyPair(): Promise<LedgerKeyPair> {
+  const pair = await globalThis.crypto.subtle.generateKey(
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    true,
+    ['sign', 'verify']
+  );
+  const publicKeyJwk = await globalThis.crypto.subtle.exportKey('jwk', pair.publicKey);
+  return {
+    privateKey: pair.privateKey,
+    publicKey: pair.publicKey,
+    publicKeyJwk,
+  };
+}
+
+/**
+ * Sign `hashHex` with an ECDSA P-256 private key and return a hex-encoded signature.
+ */
+export async function signLedgerHash(hashHex: string, privateKey: CryptoKey): Promise<string> {
+  const data = new TextEncoder().encode(hashHex);
+  const sig = await globalThis.crypto.subtle.sign(
+    { name: 'ECDSA', hash: { name: 'SHA-256' } },
+    privateKey,
+    data
+  );
+  return bytesToHex(new Uint8Array(sig));
+}
+
+/**
+ * Verify a hex-encoded ECDSA P-256 signature against a JWK public key.
+ */
+export async function verifyLedgerSignature(
+  hashHex: string,
+  signatureHex: string,
+  publicKeyJwk: JsonWebKey
+): Promise<boolean> {
+  try {
+    const pubKey = await globalThis.crypto.subtle.importKey(
+      'jwk',
+      publicKeyJwk,
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      false,
+      ['verify']
+    );
+    const data = new TextEncoder().encode(hashHex);
+    const sigBytes = hexToBytes(signatureHex);
+    return await globalThis.crypto.subtle.verify(
+      { name: 'ECDSA', hash: { name: 'SHA-256' } },
+      pubKey,
+      sigBytes as BufferSource,
+      data
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Compute a binary SHA-256 Merkle root over a list of 64-char hex hashes or arbitrary serializable items.
+ */
+export async function computeMerkleRoot(items: readonly (string | unknown)[]): Promise<string> {
+  if (items.length === 0) {
+    return GENESIS_PREV_HASH;
+  }
+
+  let layer: string[] = await Promise.all(
+    items.map((item) =>
+      typeof item === 'string' && /^[0-9a-f]{64}$/i.test(item)
+        ? Promise.resolve(item.toLowerCase())
+        : sha256Hex(canonicalizeJSON(item))
+    )
+  );
+
+  while (layer.length > 1) {
+    const nextLayer: string[] = [];
+    for (let i = 0; i < layer.length; i += 2) {
+      const left = layer[i];
+      const right = i + 1 < layer.length ? layer[i + 1] : left;
+      const combined = await sha256Hex(`${left}:${right}`);
+      nextLayer.push(combined);
+    }
+    layer = nextLayer;
+  }
+
+  return layer[0];
+}
+
