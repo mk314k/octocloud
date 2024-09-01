@@ -209,4 +209,40 @@ export class PeerConsensusEngine<Outcome extends string = string> {
     };
   }
 
+  /**
+   * Compute pairwise agreement rates in [0, 1] across all co-voted subjects.
+   */
+  public computePairwiseAgreement(allVotes: readonly PeerVote<Outcome>[]): Map<string, number> {
+    const bySubject = new Map<string, PeerVote<Outcome>[]>();
+    for (const v of allVotes) {
+      if (!bySubject.has(v.subjectId)) {
+        bySubject.set(v.subjectId, []);
+      }
+      bySubject.get(v.subjectId)!.push(v);
+    }
+
+    const pairTotals = new Map<string, { same: number; total: number }>();
+    for (const subjectVotes of bySubject.values()) {
+      const deduped = this.deduplicateSubjectVotes(subjectVotes);
+      for (let i = 0; i < deduped.length; i++) {
+        for (let j = i + 1; j < deduped.length; j++) {
+          const [a, b] = [deduped[i].voter.toLowerCase(), deduped[j].voter.toLowerCase()].sort();
+          const key = `${a}|${b}`;
+          const rec = pairTotals.get(key) ?? { same: 0, total: 0 };
+          rec.total += 1;
+          if (deduped[i].outcome === deduped[j].outcome) {
+            rec.same += 1;
+          }
+          pairTotals.set(key, rec);
+        }
+      }
+    }
+
+    const agreement = new Map<string, number>();
+    for (const [key, stats] of pairTotals.entries()) {
+      agreement.set(key, stats.total > 0 ? stats.same / stats.total : 0.5);
+    }
+    return agreement;
+  }
+
 }
