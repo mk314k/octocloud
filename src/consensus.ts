@@ -245,4 +245,106 @@ export class PeerConsensusEngine<Outcome extends string = string> {
     return agreement;
   }
 
+  /**
+   * Recompute subject outcomes and voter credibility records over `rounds` iterations.
+   */
+  public computeNetworkState(
+    allVotes: readonly PeerVote<Outcome>[],
+    rounds = 2
+  ): {
+    subjects: Map<string, SubjectConsensusResult<Outcome>>;
+    credibility: Map<string, PeerCredibilityRecord>;
+  } {
+    const subjectIds = Array.from(new Set(allVotes.map((v) => v.subjectId)));
+    const voters = Array.from(new Set(allVotes.map((v) => v.voter.toLowerCase())));
+    const pairwiseAgreement = this.computePairwiseAgreement(allVotes);
+
+    const scoreMap = new Map<string, number>();
+    for (const voter of voters) {
+      scoreMap.set(voter, this.options.defaultCredibility);
+    }
+
+    let subjects = new Map<string, SubjectConsensusResult<Outcome>>();
+    const statsByVoter = new Map<
+      string,
+      { totalVotes: number; alignedVotes: number; evidenceCount: number }
+    >();
+
+    for (let round = 0; round < Math.max(1, rounds); round++) {
+      subjects = new Map();
+      for (const sid of subjectIds) {
+        subjects.set(
+          sid,
+          this.evaluateSubject(sid, allVotes, scoreMap, pairwiseAgreement)
+        );
+      }
+
+      const nextScores = new Map<string, number>();
+      statsByVoter.clear();
+
+      for (const voter of voters) {
+        nextScores.set(voter, this.options.defaultCredibility);
+        statsByVoter.set(voter, { totalVotes: 0, alignedVotes: 0, evidenceCount: 0 });
+      }
+
+      for (const sid of subjectIds) {
+        const subjectVotes = this.deduplicateSubjectVotes(
+          allVotes.filter((v) => v.subjectId === sid)
+        );
+        const consensus = subjects.get(sid)!;
+
+        subjectVotes.forEach((vote, orderIndex) => {
+          const voterKey = vote.voter.toLowerCase();
+          const st = statsByVoter.get(voterKey)!;
+          st.totalVotes += 1;
+          const hasEvidence = Boolean(vote.evidenceUrl && /^https?:\/\//i.test(vote.evidenceUrl.trim()));
+          if (hasEvidence) {
+            st.evidenceCount += 1;
+          }
+
+          if (!consensus.isResolved) return;
+
+          const currentScore = nextScores.get(voterKey) ?? this.options.defaultCredibility;
+          if (vote.outcome === consensus.winningOutcome) {
+            st.alignedVotes += 1;
+            const earlyMultiplier = orderIndex < 2 ? 1.25 : 1.0;
+            const evidenceBonus = hasEvidence ? 0.04 : 0;
+            const delta = this.options.alignedReward * consensus.confidence * earlyMultiplier + evidenceBonus;
+            nextScores.set(
+              voterKey,
+              Math.min(this.options.maxCredibility, currentScore + delta)
+            );
+          } else {
+            const penalty = this.options.misalignedPenalty * consensus.confidence;
+            nextScores.set(
+              voterKey,
+              Math.max(this.options.minCredibility, currentScore - penalty)
+            );
+          }
+        });
+      }
+
+      for (const [k, v] of nextScores.entries()) {
+        scoreMap.set(k, Number(v.toFixed(4)));
+      }
+    }
+
+    const now = Date.now();
+    const credibility = new Map<string, PeerCredibilityRecord>();
+    for (const voter of voters) {
+      const st = statsByVoter.get(voter) ?? { totalVotes: 0, alignedVotes: 0, evidenceCount: 0 };
+      const accuracyRate = st.totalVotes > 0 ? Number((st.alignedVotes / st.totalVotes).toFixed(4)) : 0;
+      credibility.set(voter, {
+        username: voter,
+        score: scoreMap.get(voter) ?? this.options.defaultCredibility,
+        totalVotes: st.totalVotes,
+        alignedVotes: st.alignedVotes,
+        evidenceCount: st.evidenceCount,
+        accuracyRate,
+        updatedAt: now,
+      });
+    }
+
+    return { subjects, credibility };
+  }
 }
