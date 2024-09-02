@@ -236,4 +236,103 @@ export class GitPartitionedEngine<Row extends TableRow = TableRow> {
     return list;
   }
 
+  /**
+   * Look up a single row by `id`, reading only the page shard recorded in `primaryKeyIndex`.
+   */
+  public async getById(id: string): Promise<Row | null> {
+    const manifest = await this.getManifest();
+    if (!manifest) return null;
+    const pageIndex = manifest.primaryKeyIndex[id];
+    if (pageIndex === undefined) return null;
+    const pageRows = await this.readPage(pageIndex);
+    return pageRows.find((r) => r.id === id) ?? null;
+  }
+
+  /**
+   * Query the inverted token index and load only the matching page shards.
+   */
+  public async searchText(query: string, limit = 10): Promise<Row[]> {
+    const manifest = await this.getManifest();
+    if (!manifest) return [];
+
+    const queryTokens = tokenizeForIndex(query);
+    if (queryTokens.length === 0) return [];
+
+    const pageHitCounts = new Map<number, number>();
+    for (const tok of queryTokens) {
+      const matchingPages = manifest.invertedTokenIndex[tok] ?? [];
+      for (const pIdx of matchingPages) {
+        pageHitCounts.set(pIdx, (pageHitCounts.get(pIdx) ?? 0) + 1);
+      }
+    }
+
+    const candidatePages = Array.from(pageHitCounts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .map(([pIdx]) => pIdx);
+
+    const results: Array<{ row: Row; score: number }> = [];
+    for (const pIdx of candidatePages) {
+      const pageRows = await this.readPage(pIdx);
+      for (const row of pageRows) {
+        const combinedText = this.options.textIndexFields
+          .map((f) => String(row[f] ?? ''))
+          .join(' ')
+          .toLowerCase();
+        let hits = 0;
+        for (const tok of queryTokens) {
+          if (combinedText.includes(tok)) hits += 1;
+        }
+        if (hits > 0) {
+          results.push({ row, score: hits / queryTokens.length });
+        }
+      }
+    }
+
+    results.sort((a, b) => b.score - a.score);
+    return results.slice(0, limit).map((r) => r.row);
+  }
+
+  /**
+   * Rank page shards by centroid cosine similarity, load the top `probePages` shards,
+   * and return the highest-scoring rows above `threshold`.
+   */
+  public async searchVectorANN(options: {
+    vector: number[];
+    threshold?: number;
+    topK?: number;
+    probePages?: number;
+  }): Promise<Array<Row & { _similarity: number }>> {
+    const manifest = await this.getManifest();
+    if (!manifest || !this.options.vectorField) return [];
+
+    const { vector, threshold = 0.5, topK = 5, probePages = 2 } = options;
+    const vectorField = this.options.vectorField;
+
+    const rankedPages = manifest.pages
+      .map((p) => ({
+        pageIndex: p.pageIndex,
+        centroidSim: p.vectorCentroid ? cosineSimilarity(vector, p.vectorCentroid) : 1,
+      }))
+      .sort((a, b) => b.centroidSim - a.centroidSim)
+      .slice(0, Math.max(1, probePages));
+
+    const pageLists = await Promise.all(rankedPages.map((p) => this.readPage(p.pageIndex)));
+
+    const scored: Array<Row & { _similarity: number }> = [];
+    for (const rows of pageLists) {
+      for (const row of rows) {
+        const candidateVec = row[vectorField];
+        if (Array.isArray(candidateVec)) {
+          const sim = cosineSimilarity(vector, candidateVec as number[]);
+          if (sim >= threshold) {
+            scored.push({ ...row, _similarity: sim });
+          }
+        }
+      }
+    }
+
+    scored.sort((a, b) => b._similarity - a._similarity);
+    return scored.slice(0, topK);
+  }
 }
+
