@@ -336,3 +336,101 @@ export class GitPartitionedEngine<Row extends TableRow = TableRow> {
   }
 }
 
+/**
+ * HTTP Range reader (`GitSqliteVfs`) for fetching fixed-size binary pages (default: 4096 bytes)
+ * with an in-memory LRU page cache.
+ */
+export class GitSqliteVfs {
+  public readonly pageSize: number;
+  public readonly maxCachedPages: number;
+  private readonly fetchImpl: typeof fetch;
+  private pageCache: Map<number, Uint8Array> = new Map();
+  private networkRangeRequests = 0;
+
+  constructor(
+    public readonly databaseUrl: string,
+    options: {
+      pageSize?: number;
+      maxCachedPages?: number;
+      fetchImpl?: typeof fetch;
+    } = {}
+  ) {
+    this.pageSize = options.pageSize ?? 4096;
+    this.maxCachedPages = options.maxCachedPages ?? 64;
+    this.fetchImpl = options.fetchImpl ?? fetch.bind(globalThis);
+  }
+
+  /** Total HTTP Range requests issued (excluding cache hits). */
+  public get rangeRequestCount(): number {
+    return this.networkRangeRequests;
+  }
+
+  /** Clear the in-memory page cache. */
+  public clearCache(): void {
+    this.pageCache.clear();
+  }
+
+  /**
+   * Fetch a single `pageSize`-aligned page by 0-based `pageNumber` using `Range: bytes=start-end`.
+   */
+  public async readPageBytes(pageNumber: number): Promise<Uint8Array> {
+    if (this.pageCache.has(pageNumber)) {
+      const hit = this.pageCache.get(pageNumber)!;
+      this.pageCache.delete(pageNumber);
+      this.pageCache.set(pageNumber, hit);
+      return hit;
+    }
+
+    const startByte = pageNumber * this.pageSize;
+    const endByte = startByte + this.pageSize - 1;
+    this.networkRangeRequests += 1;
+
+    const res = await this.fetchImpl(this.databaseUrl, {
+      headers: {
+        Range: `bytes=${startByte}-${endByte}`,
+      },
+    });
+
+    if (!res.ok && res.status !== 206) {
+      throw new Error(`HTTP Range request failed for page ${pageNumber} (HTTP ${res.status})`);
+    }
+
+    const buf = new Uint8Array(await res.arrayBuffer());
+    const pageBytes = buf.byteLength > this.pageSize ? buf.subarray(0, this.pageSize) : buf;
+
+    if (this.pageCache.size >= this.maxCachedPages) {
+      const oldestKey = this.pageCache.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.pageCache.delete(oldestKey);
+      }
+    }
+    this.pageCache.set(pageNumber, pageBytes);
+    return pageBytes;
+  }
+
+  /**
+   * Read `[offset, offset + length)` across one or more cached pages.
+   */
+  public async readBytes(offset: number, length: number): Promise<Uint8Array> {
+    if (length <= 0) return new Uint8Array(0);
+    const startPage = Math.floor(offset / this.pageSize);
+    const endPage = Math.floor((offset + length - 1) / this.pageSize);
+
+    const out = new Uint8Array(length);
+    let written = 0;
+
+    for (let p = startPage; p <= endPage; p++) {
+      const page = await this.readPageBytes(p);
+      const pageStartOffset = p * this.pageSize;
+      const sliceStart = Math.max(0, offset - pageStartOffset);
+      const sliceEnd = Math.min(page.byteLength, offset + length - pageStartOffset);
+      if (sliceEnd > sliceStart) {
+        const chunk = page.subarray(sliceStart, sliceEnd);
+        out.set(chunk, written);
+        written += chunk.byteLength;
+      }
+    }
+
+    return written === length ? out : out.subarray(0, written);
+  }
+}
