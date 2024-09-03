@@ -500,4 +500,111 @@ export class GitRepoStore {
     };
   }
 
+  /**
+   * Apply multiple file additions, updates, or deletions in a single Git commit
+   * via the Git Data API (`git/ref` -> `git/trees` -> `git/commits` -> `git/refs`).
+   */
+  public async commitBatch(
+    changes: readonly BatchFileChange[],
+    commitMessage = 'Batch update',
+    branch = 'main'
+  ): Promise<BatchCommitResult> {
+    this.auth.assertWriteAllowed(this.auth.repo);
+    if (changes.length === 0) {
+      throw new Error('commitBatch() requires at least one file change');
+    }
+
+    const owner = this.auth.username;
+    const repo = this.auth.repo;
+    const baseApi = `https://api.github.com/repos/${owner}/${repo}`;
+
+    const refRes = await this.auth.options.fetchImpl(`${baseApi}/git/ref/heads/${branch}`, {
+      headers: this.auth.getHeaders(),
+    });
+    if (!refRes.ok) {
+      throw new Error(`Failed to resolve ref heads/${branch} on ${owner}/${repo} (HTTP ${refRes.status})`);
+    }
+    const refData = await refRes.json();
+    const baseCommitSha: string = refData?.object?.sha || '';
+    if (!baseCommitSha) {
+      throw new Error(`Branch heads/${branch} did not return a valid base commit SHA`);
+    }
+
+    const treeEntries = changes.map((change) => {
+      const cleanPath = sanitizeRepoPath(change.path);
+      if (change.content === null) {
+        return {
+          path: cleanPath,
+          mode: '100644',
+          type: 'blob',
+          sha: null,
+        };
+      }
+      return {
+        path: cleanPath,
+        mode: '100644',
+        type: 'blob',
+        content: change.content,
+      };
+    });
+
+    const treeRes = await this.auth.options.fetchImpl(`${baseApi}/git/trees`, {
+      method: 'POST',
+      headers: this.auth.getHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        base_tree: baseCommitSha,
+        tree: treeEntries,
+      }),
+    });
+    if (!treeRes.ok) {
+      throw new Error(`Failed to create Git tree on ${owner}/${repo} (HTTP ${treeRes.status})`);
+    }
+    const treeData = await treeRes.json();
+    const newTreeSha: string = treeData?.sha || '';
+
+    const commitRes = await this.auth.options.fetchImpl(`${baseApi}/git/commits`, {
+      method: 'POST',
+      headers: this.auth.getHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        message: commitMessage,
+        tree: newTreeSha,
+        parents: [baseCommitSha],
+      }),
+    });
+    if (!commitRes.ok) {
+      throw new Error(`Failed to create Git commit on ${owner}/${repo} (HTTP ${commitRes.status})`);
+    }
+    const commitData = await commitRes.json();
+    const newCommitSha: string = commitData?.sha || '';
+
+    const patchRes = await this.auth.options.fetchImpl(`${baseApi}/git/refs/heads/${branch}`, {
+      method: 'PATCH',
+      headers: this.auth.getHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        sha: newCommitSha,
+        force: false,
+      }),
+    });
+    if (!patchRes.ok) {
+      throw new Error(`Failed to advance ref heads/${branch} on ${owner}/${repo} (HTTP ${patchRes.status})`);
+    }
+
+    for (const change of changes) {
+      const cleanPath = sanitizeRepoPath(change.path);
+      const cacheKey = `${owner}/${repo}/${cleanPath}`;
+      if (change.content === null) {
+        this.contentCache.delete(cacheKey);
+        this.shaCache.delete(cacheKey);
+      } else {
+        this.contentCache.set(cacheKey, change.content);
+      }
+    }
+
+    return {
+      commitSha: newCommitSha,
+      treeSha: newTreeSha,
+      branch,
+      fileCount: changes.length,
+    };
+  }
 }
