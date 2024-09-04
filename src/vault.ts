@@ -136,3 +136,97 @@ export async function decryptEnvelopeWithPassphrase(
   }
 }
 
+export class GitEncryptedStore {
+  public readonly vaultDir: string;
+  public readonly iterations: number;
+
+  constructor(
+    public readonly store: GitRepoStore,
+    options: EncryptedVaultOptions = {}
+  ) {
+    this.vaultDir = sanitizeRepoPath(options.vaultDir ?? 'vault');
+    this.iterations = options.iterations ?? 100_000;
+  }
+
+  private resolveSecretPath(secretName: string): string {
+    const clean = sanitizeRepoPath(secretName);
+    const filename = clean.endsWith('.enc.json') ? clean : `${clean}.enc.json`;
+    return `${this.vaultDir}/${filename}`;
+  }
+
+  /**
+   * Encrypt and write a UTF-8 string to `<vaultDir>/<secretName>.enc.json`.
+   */
+  public async writeSecretText(
+    secretName: string,
+    plaintext: string,
+    passphrase: string,
+    commitMessage?: string
+  ): Promise<{ path: string; sha: string; envelope: EncryptedEnvelope }> {
+    const path = this.resolveSecretPath(secretName);
+    const envelope = await encryptPayloadWithPassphrase(plaintext, passphrase, this.iterations);
+    const res = await this.store.writeJSON(
+      path,
+      envelope,
+      commitMessage || `Update encrypted vault item ${secretName}`
+    );
+    return { path: res.path, sha: res.sha, envelope };
+  }
+
+  /**
+   * Read and decrypt a UTF-8 string from `<vaultDir>/<secretName>.enc.json`.
+   */
+  public async readSecretText(
+    secretName: string,
+    passphrase: string,
+    ownerOverride?: string,
+    repoOverride?: string
+  ): Promise<string> {
+    const path = this.resolveSecretPath(secretName);
+    const envelope = await this.store.readJSON<EncryptedEnvelope>(path, ownerOverride, repoOverride);
+    return decryptEnvelopeWithPassphrase(envelope, passphrase);
+  }
+
+  /**
+   * Encrypt and store a JSON-serializable value in `<vaultDir>/<secretName>.enc.json`.
+   */
+  public async writeSecretJSON<T = unknown>(
+    secretName: string,
+    data: T,
+    passphrase: string,
+    commitMessage?: string
+  ): Promise<{ path: string; sha: string; envelope: EncryptedEnvelope }> {
+    const serialized = JSON.stringify(data);
+    return this.writeSecretText(secretName, serialized, passphrase, commitMessage);
+  }
+
+  /**
+   * Read and decrypt a JSON value from `<vaultDir>/<secretName>.enc.json`.
+   */
+  public async readSecretJSON<T = unknown>(
+    secretName: string,
+    passphrase: string,
+    ownerOverride?: string,
+    repoOverride?: string
+  ): Promise<T> {
+    const decrypted = await this.readSecretText(secretName, passphrase, ownerOverride, repoOverride);
+    return JSON.parse(decrypted) as T;
+  }
+
+  /**
+   * Serialize an `EncryptedEnvelope` as a portable `octovault_v1_<base64>` string.
+   */
+  public static exportPortableToken(envelope: EncryptedEnvelope): string {
+    return `octovault_v1_${encodeBase64UTF8(JSON.stringify(envelope))}`;
+  }
+
+  /**
+   * Decode a portable `octovault_v1_<base64>` string back into an `EncryptedEnvelope`.
+   */
+  public static parsePortableToken(token: string): EncryptedEnvelope {
+    const trimmed = token.trim();
+    const prefix = 'octovault_v1_';
+    const raw = trimmed.startsWith(prefix) ? trimmed.slice(prefix.length) : trimmed;
+    return JSON.parse(decodeBase64UTF8(raw)) as EncryptedEnvelope;
+  }
+}
