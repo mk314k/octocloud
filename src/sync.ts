@@ -140,4 +140,70 @@ export class GitSyncQueue {
     }, this.options.autoFlushDebounceMs);
   }
 
+  /**
+   * Enqueue a UTF-8 file write, replacing any prior un-flushed operation for `filePath`.
+   */
+  public enqueueWrite(filePath: string, content: string): QueuedOperation {
+    const cleanPath = sanitizeRepoPath(filePath);
+    const op: QueuedOperation = {
+      path: cleanPath,
+      content,
+      queuedAt: Date.now(),
+    };
+    this.pendingOps.set(cleanPath, op);
+    this.persistToStorage();
+    this.channel?.postMessage({ type: 'ENQUEUE', op });
+    this.notifyListeners();
+    this.scheduleAutoFlush();
+    return op;
+  }
+
+  /**
+   * Enqueue a JSON file write.
+   */
+  public enqueueJSON<T = unknown>(filePath: string, data: T): QueuedOperation {
+    return this.enqueueWrite(filePath, JSON.stringify(data, null, 2));
+  }
+
+  /**
+   * Enqueue a file deletion.
+   */
+  public enqueueDelete(filePath: string): QueuedOperation {
+    const cleanPath = sanitizeRepoPath(filePath);
+    const op: QueuedOperation = {
+      path: cleanPath,
+      content: null,
+      queuedAt: Date.now(),
+    };
+    this.pendingOps.set(cleanPath, op);
+    this.persistToStorage();
+    this.channel?.postMessage({ type: 'ENQUEUE', op });
+    this.notifyListeners();
+    this.scheduleAutoFlush();
+    return op;
+  }
+
+  /**
+   * Read a file through the local queue overlay before falling back to `store.readFile()`.
+   */
+  public async readOptimistic(filePath: string): Promise<string> {
+    const cleanPath = sanitizeRepoPath(filePath);
+    if (this.pendingOps.has(cleanPath)) {
+      const pending = this.pendingOps.get(cleanPath)!;
+      if (pending.content === null) {
+        throw new Error(`File "${cleanPath}" is marked for deletion in GitSyncQueue`);
+      }
+      return pending.content;
+    }
+    return this.store.readFile(cleanPath);
+  }
+
+  /**
+   * Read and parse a JSON file through the local queue overlay.
+   */
+  public async readOptimisticJSON<T = unknown>(filePath: string): Promise<T> {
+    const raw = await this.readOptimistic(filePath);
+    return JSON.parse(raw) as T;
+  }
+
 }
