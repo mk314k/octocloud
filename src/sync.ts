@@ -206,4 +206,52 @@ export class GitSyncQueue {
     return JSON.parse(raw) as T;
   }
 
+  /**
+   * Flush all pending operations via `store.commitBatch()`.
+   */
+  public async flush(commitMessage?: string): Promise<BatchCommitResult | null> {
+    if (this.isFlushing || this.pendingOps.size === 0) {
+      return null;
+    }
+    this.isFlushing = true;
+
+    const opsToFlush = this.getPendingOperations();
+    const changes: BatchFileChange[] = opsToFlush.map((op) => ({
+      path: op.path,
+      content: op.content,
+    }));
+
+    try {
+      const msg = commitMessage || `Sync ${changes.length} file(s)`;
+      const result = await this.store.commitBatch(changes, msg, this.options.branch);
+
+      const flushedPaths: string[] = [];
+      for (const op of opsToFlush) {
+        const current = this.pendingOps.get(op.path);
+        if (current && current.queuedAt <= op.queuedAt) {
+          this.pendingOps.delete(op.path);
+          flushedPaths.push(op.path);
+        }
+      }
+
+      this.persistToStorage();
+      this.channel?.postMessage({ type: 'FLUSHED', paths: flushedPaths });
+      this.notifyListeners();
+      return result;
+    } finally {
+      this.isFlushing = false;
+    }
+  }
+
+  /** Close the `BroadcastChannel` and clear any active debounce timer. */
+  public destroy(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    if (this.channel) {
+      this.channel.close();
+      this.channel = null;
+    }
+  }
 }
