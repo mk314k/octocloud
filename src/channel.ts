@@ -175,4 +175,90 @@ export class GitChannel<Payload = unknown> {
     return presence;
   }
 
+  /**
+   * Read `channels/<channelName>/inbox.json` across `peerUsernames` in parallel,
+   * returning unseen messages addressed to this user (or broadcast) and current presence states.
+   */
+  public async pollPeers(
+    peerUsernames: readonly string[],
+    repoOverride = this.store.auth.repo
+  ): Promise<{
+    newMessages: ChannelEnvelope<Payload>[];
+    presence: PeerPresenceState[];
+  }> {
+    const allUsers = Array.from(
+      new Set([this.store.auth.username, ...peerUsernames].map((u) => u.trim()).filter(Boolean))
+    );
+
+    const inboxes = await Promise.all(
+      allUsers.map((username) =>
+        this.store
+          .readJSON<ChannelInboxState<Payload>>(this.inboxPath, username, repoOverride)
+          .catch(() => null)
+      )
+    );
+
+    const now = Date.now();
+    const presenceList: PeerPresenceState[] = [];
+    const discoveredMessages: ChannelEnvelope<Payload>[] = [];
+    const localUser = this.store.auth.username.toLowerCase();
+
+    for (const inbox of inboxes) {
+      if (!inbox) continue;
+      if (inbox.presence) {
+        const isExpired = now - inbox.presence.lastSeen > this.options.presenceTtlMs;
+        presenceList.push({
+          ...inbox.presence,
+          status: isExpired ? 'offline' : inbox.presence.status,
+        });
+      }
+
+      if (Array.isArray(inbox.messages)) {
+        for (const msg of inbox.messages) {
+          if (!msg || !msg.id || this.seenMessageIds.has(msg.id)) continue;
+          if (msg.recipient && localUser && msg.recipient.toLowerCase() !== localUser) {
+            continue;
+          }
+          this.seenMessageIds.add(msg.id);
+          discoveredMessages.push(msg);
+        }
+      }
+    }
+
+    discoveredMessages.sort((a, b) => a.timestamp - b.timestamp);
+
+    for (const msg of discoveredMessages) {
+      for (const listener of this.msgListeners) {
+        listener(msg);
+      }
+    }
+
+    for (const pListener of this.presenceListeners) {
+      pListener(presenceList);
+    }
+
+    return {
+      newMessages: discoveredMessages,
+      presence: presenceList,
+    };
+  }
+
+  /**
+   * Poll `peerUsernames` on a fixed interval.
+   */
+  public startPolling(peerUsernames: readonly string[], intervalMs = 3500): void {
+    this.stopPolling();
+    this.pollTimer = setInterval(() => {
+      this.pollPeers(peerUsernames).catch(() => {});
+    }, intervalMs);
+  }
+
+  /** Stop active interval polling. */
+  public stopPolling(): void {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+  }
+
 }
