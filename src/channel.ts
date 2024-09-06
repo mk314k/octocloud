@@ -261,4 +261,67 @@ export class GitChannel<Payload = unknown> {
     }
   }
 
+  /**
+   * Exchange WebRTC `GitPeerRoom` offer/answer tickets over this channel:
+   * - `'initiator'`: creates an offer ticket and publishes `'WEBRTC_OFFER'` to `remoteUsername`.
+   * - `'responder'`: polls `remoteUsername` for `'WEBRTC_OFFER'` and replies with `'WEBRTC_ANSWER'`.
+   */
+  public async negotiateWebRTCPeer<T = unknown>(
+    peerRoom: GitPeerRoom<T>,
+    remoteUsername: string,
+    role: 'initiator' | 'responder'
+  ): Promise<{ completed: boolean; remoteTicket?: string }> {
+    const signalChannel = this as unknown as GitChannel<{ ticket: string; roomId: string }>;
+
+    if (role === 'initiator') {
+      const offerTicket = await peerRoom.createOfferTicket();
+      await signalChannel.publish(
+        'WEBRTC_OFFER',
+        { ticket: offerTicket, roomId: peerRoom.roomId },
+        { recipient: remoteUsername }
+      );
+      return { completed: false, remoteTicket: offerTicket };
+    }
+
+    const { newMessages } = await signalChannel.pollPeers([remoteUsername]);
+    const offerMsg = newMessages.find(
+      (m) =>
+        m.topic === 'WEBRTC_OFFER' &&
+        m.sender.username.toLowerCase() === remoteUsername.toLowerCase() &&
+        m.payload?.roomId === peerRoom.roomId
+    );
+
+    if (!offerMsg) {
+      return { completed: false };
+    }
+
+    const answerTicket = await peerRoom.acceptOfferAndCreateAnswer(offerMsg.payload.ticket);
+    await signalChannel.publish(
+      'WEBRTC_ANSWER',
+      { ticket: answerTicket, roomId: peerRoom.roomId },
+      { recipient: remoteUsername }
+    );
+    return { completed: true, remoteTicket: answerTicket };
+  }
+
+  /**
+   * Complete the initiator side of a WebRTC handshake once `'WEBRTC_ANSWER'` is received from `remoteUsername`.
+   */
+  public async finalizeWebRTCInitiator<T = unknown>(
+    peerRoom: GitPeerRoom<T>,
+    remoteUsername: string
+  ): Promise<PlayerIdentity | null> {
+    const signalChannel = this as unknown as GitChannel<{ ticket: string; roomId: string }>;
+    const { newMessages } = await signalChannel.pollPeers([remoteUsername]);
+    const answerMsg = newMessages.find(
+      (m) =>
+        m.topic === 'WEBRTC_ANSWER' &&
+        m.sender.username.toLowerCase() === remoteUsername.toLowerCase() &&
+        m.payload?.roomId === peerRoom.roomId
+    );
+    if (!answerMsg) {
+      return null;
+    }
+    return peerRoom.completeHandshake(answerMsg.payload.ticket);
+  }
 }
