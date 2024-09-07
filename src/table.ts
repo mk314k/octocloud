@@ -6,7 +6,7 @@
  *   - `'sharded'`: one file per row under `tables/<tableName>/rows/<id>.json`.
  *   - `'indexed-sharded'`: per-row files plus a compacted `tables/<tableName>.index.json` snapshot.
  */
-import { GitRepoStore, sanitizeRepoPath } from './store';
+import { GitRepoStore, sanitizeRepoPath } from './store.js';
 
 export interface TableRow {
   id: string;

@@ -5,7 +5,7 @@ export {
   type GitUserProfile,
   type GitAuthOptions,
   type AuthStateListener,
-} from './auth';
+} from './auth.js';
 
 export {
   GitRepoStore,
@@ -17,7 +17,7 @@ export {
   type PullRequestProposalResult,
   type BatchFileChange,
   type BatchCommitResult,
-} from './store';
+} from './store.js';
 
 export {
   GitTable,
@@ -26,7 +26,7 @@ export {
   type VectorSimilarityClause,
   type SelectQuery,
   type GitTableOptions,
-} from './table';
+} from './table.js';
 
 export {
   GitLedger,
@@ -39,7 +39,7 @@ export {
   type LedgerEntry,
   type LedgerVerificationResult,
   type LedgerKeyPair,
-} from './ledger';
+} from './ledger.js';
 
 export {
   PeerConsensusEngine,
@@ -47,7 +47,7 @@ export {
   type PeerCredibilityRecord,
   type SubjectConsensusResult,
   type ConsensusEngineOptions,
-} from './consensus';
+} from './consensus.js';
 
 export {
   GitPartitionedEngine,
@@ -56,7 +56,7 @@ export {
   type PartitionPageMeta,
   type PartitionManifest,
   type PartitionEngineOptions,
-} from './sqlite';
+} from './sqlite.js';
 
 export {
   GitEncryptedStore,
@@ -64,14 +64,14 @@ export {
   decryptEnvelopeWithPassphrase,
   type EncryptedEnvelope,
   type EncryptedVaultOptions,
-} from './vault';
+} from './vault.js';
 
 export {
   GitSyncQueue,
   type QueuedOperation,
   type SyncQueueOptions,
   type SyncQueueListener,
-} from './sync';
+} from './sync.js';
 
 export {
   GitChannel,
@@ -81,7 +81,7 @@ export {
   type ChannelMessageListener,
   type PresenceListener,
   type GitChannelOptions,
-} from './channel';
+} from './channel.js';
 
 export {
   GitPeerRoom,
@@ -93,14 +93,14 @@ export {
   type SharedMatchState,
   type MessageListener,
   type PeerConnectionListener,
-} from './multiplayer';
+} from './multiplayer.js';
 
 export {
   GitAuthModal,
   type GitAuthModalOptions,
-} from './modal';
+} from './modal.js';
 
 export {
   encodeBase64UTF8,
   decodeBase64UTF8,
-} from './base64';
+} from './base64.js';

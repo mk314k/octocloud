@@ -4,8 +4,8 @@
  * Each participant writes messages and presence heartbeats to their own repository
  * at `channels/<channelName>/inbox.json` and polls peer inboxes across repositories.
  */
-import { GitRepoStore, sanitizeRepoPath } from './store';
-import { PlayerIdentity, GitPeerRoom } from './multiplayer';
+import { GitRepoStore, sanitizeRepoPath } from './store.js';
+import { PlayerIdentity, GitPeerRoom } from './multiplayer.js';
 
 export interface ChannelEnvelope<Payload = unknown> {
   id: string;

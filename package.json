@@ -1,7 +1,7 @@
 {
   "name": "octocloud",
-  "version": "0.1.0",
-  "description": "Serverless GitHub Authentication, Sandboxed Cloud Repository File Store, and Verified P2P/Repo Multiplayer SDK for GitHub Pages & static web apps.",
+  "version": "0.2.0",
+  "description": "GitHub-backed authentication, sandboxed file and table storage, encrypted vault, hash-chained ledger, partitioned page shards, and WebRTC/federated multiplayer SDK for static web apps.",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -21,7 +21,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "tsx --test tests/*.test.ts",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build && npm test"
   },
   "repository": {
     "type": "git",
@@ -32,7 +33,13 @@
     "github-auth",
     "github-pages",
     "serverless-storage",
-    "cloud-store",
+    "vector-search",
+    "sqlite-vfs",
+    "merkle-ledger",
+    "peer-consensus",
+    "encrypted-vault",
+    "offline-sync",
+    "pubsub",
     "webrtc-multiplayer",
     "oauth",
     "pat"

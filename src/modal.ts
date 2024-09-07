@@ -3,7 +3,7 @@
  * Can be mounted into any DOM element in a static web app or game to provide
  * one-click GitHub OAuth, Personal Access Token (PAT), or Read-Only Username login.
  */
-import { GitCloudAuth, GitUserProfile } from './auth';
+import { GitCloudAuth, GitUserProfile } from './auth.js';
 
 export interface GitAuthModalOptions {
   title?: string;

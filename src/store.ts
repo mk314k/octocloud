@@ -4,8 +4,8 @@
  * Wraps the GitHub Contents API, Git Data Trees API, and raw content CDN
  * behind path normalization and repository write sandboxing.
  */
-import { GitCloudAuth } from './auth';
-import { encodeBase64UTF8, decodeBase64UTF8 } from './base64';
+import { GitCloudAuth } from './auth.js';
+import { encodeBase64UTF8, decodeBase64UTF8 } from './base64.js';
 
 export interface RepoFileEntry {
   name: string;

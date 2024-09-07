@@ -4,8 +4,8 @@
  * Derives a 256-bit AES-GCM key from a user passphrase via `PBKDF2-HMAC-SHA256`
  * and stores authenticated ciphertext envelopes under `<vaultDir>/<name>.enc.json`.
  */
-import { GitRepoStore, sanitizeRepoPath } from './store';
-import { encodeBase64UTF8, decodeBase64UTF8 } from './base64';
+import { GitRepoStore, sanitizeRepoPath } from './store.js';
+import { encodeBase64UTF8, decodeBase64UTF8 } from './base64.js';
 
 export interface EncryptedEnvelope {
   version: 1;

@@ -4,7 +4,7 @@
  * Entries are linked via SHA-256 `prevHash` pointers over canonicalized JSON payloads,
  * with optional WebCrypto ECDSA P-256 signatures and binary Merkle root computation.
  */
-import { GitRepoStore, sanitizeRepoPath } from './store';
+import { GitRepoStore, sanitizeRepoPath } from './store.js';
 
 export interface LedgerEntry<Payload = unknown> {
   /** 0-based sequential index */

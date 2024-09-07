@@ -6,9 +6,9 @@
  * - `GitRepoRoom`: synchronizes turn-based state across player repositories (`rooms/<roomId>.json`)
  *   without sharing access tokens.
  */
-import { GitCloudAuth, GitUserProfile } from './auth';
-import { GitRepoStore } from './store';
-import { encodeBase64UTF8, decodeBase64UTF8 } from './base64';
+import { GitCloudAuth, GitUserProfile } from './auth.js';
+import { GitRepoStore } from './store.js';
+import { encodeBase64UTF8, decodeBase64UTF8 } from './base64.js';
 
 export interface PlayerIdentity {
   username: string;

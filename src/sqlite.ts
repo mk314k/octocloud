@@ -7,8 +7,8 @@
  * - `GitSqliteVfs`: reads fixed-size binary pages via `Range: bytes=start-end`
  *   with an in-memory LRU page cache.
  */
-import { GitRepoStore, sanitizeRepoPath } from './store';
-import { TableRow, cosineSimilarity } from './table';
+import { GitRepoStore, sanitizeRepoPath } from './store.js';
+import { TableRow, cosineSimilarity } from './table.js';
 
 export interface PartitionPageMeta {
   pageIndex: number;

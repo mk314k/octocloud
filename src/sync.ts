@@ -5,7 +5,7 @@
  * broadcasts queue mutations across same-origin tabs via `BroadcastChannel`, and flushes
  * pending changes in a single commit via `store.commitBatch()`.
  */
-import { GitRepoStore, sanitizeRepoPath, BatchFileChange, BatchCommitResult } from './store';
+import { GitRepoStore, sanitizeRepoPath, BatchFileChange, BatchCommitResult } from './store.js';
 
 export interface QueuedOperation {
   path: string;
