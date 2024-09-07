@@ -1,25 +1,18 @@
-# OctoCloud
+# octocloud
 
-**`octocloud`** is a zero-dependency **Serverless GitHub Authentication, Sandboxed Cloud Repository File & Table Store, and Verified Multiplayer SDK** for static web applications and browser games hosted on **GitHub Pages** (or any static host).
+`octocloud` is a zero-dependency TypeScript SDK that uses a user's GitHub account and public repository as a client-side authentication provider, structured file/table store, encrypted secret vault, append-only ledger, and P2P/federated multiplayer backend for static web applications.
 
-It turns a user's own GitHub account and public workspace repository into a free, zero-backend authentication provider, cloud file/table store, and multiplayer game lobby—without ever exposing private repositories.
+## Design Overview
 
-## Security-First Architecture
-
-1. **Private Repositories Are Never Exposed (`oauthScope: 'public_repo'`)**:
-   - Defaults to GitHub's `public_repo` OAuth scope rather than `repo`, ensuring the browser token **cannot read or modify any private repositories**.
-   - Supports Fine-Grained Personal Access Tokens (`github_pat_...`) scoped to a single workspace repository.
-2. **Repository Write Sandbox & Path Traversal Protection**:
-   - Automatically blocks writes to `<username>.github.io` sites, `protectedRepos`, or any path containing `..` traversal segments.
-   - Supports `strictRepoSandbox: true` to lock all file writes strictly to `allowedRepos`.
-3. **Ephemeral `sessionStorage` Persistence by Default**:
-   - Tokens are stored in `sessionStorage` (`persistence: 'session'`) by default and wiped as soon as the tab closes.
-4. **Anti-Spoofing Multiplayer Session Proofs & Dual-Repo Federation**:
-   - Tokens are **never** shared between players.
-   - In WebRTC P2P mode (`GitPeerRoom`), players can publish a `SessionProof` to their own repo (`publishIdentityProof`) and peers verify ownership directly against GitHub's API (`verifyPeerIdentity`).
-   - In Turn-Based Repo mode (`GitRepoRoom`), **Dual-Repo Federation** lets Player 1 write moves to `Player1/<repo>` and Player 2 write moves to `Player2/<repo>`, while both read each other's public repo to sync the latest move version!
-
----
+- **Least-privilege OAuth scope (`oauthScope: 'public_repo'`)**: Defaults to `public_repo` rather than `repo` so browser sessions cannot read or modify private repositories. Also supports Fine-Grained Personal Access Tokens (`github_pat_...`) scoped to a single workspace repository.
+- **Repository write sandbox**: Rejects writes to `<username>.github.io` repositories, configured `protectedRepos`, or paths containing `.` / `..` segments. Setting `strictRepoSandbox: true` restricts writes to `allowedRepos`.
+- **Session storage**: Persists session state in `sessionStorage` by default (`persistence: 'session'`), with `'local'` and `'memory'` options.
+- **CDN reads, conditional requests, and batch commits**:
+  - `readPublicFile()` and `readPublicJSON()` read from `raw.githubusercontent.com` first with fallback to the REST Contents API.
+  - `readFile()` caches response `ETag` headers and sends `If-None-Match` on subsequent reads.
+  - `writeFile()` refreshes the remote blob SHA and retries once on HTTP `409` / `422` conflicts.
+  - `commitBatch()` writes or deletes multiple files in a single commit via the Git Data API (`git/trees` -> `git/commits` -> `git/refs`).
+  - `proposeFileChangeViaPR()` forks an upstream repository, commits a file to a branch on the fork, and opens a pull request.
 
 ## Installation
 
@@ -27,11 +20,9 @@ It turns a user's own GitHub account and public workspace repository into a free
 npm install octocloud
 ```
 
----
+## Usage
 
-## Quickstart Usage
-
-### 1. Authenticate & Read/Write Cloud Files (`GitCloudAuth` + `GitRepoStore`)
+### Authentication and File Storage (`GitCloudAuth`, `GitRepoStore`, `GitAuthModal`)
 
 ```typescript
 import { GitCloudAuth, GitRepoStore, GitAuthModal } from 'octocloud';
@@ -39,66 +30,143 @@ import { GitCloudAuth, GitRepoStore, GitAuthModal } from 'octocloud';
 const auth = new GitCloudAuth({
   defaultRepo: 'MyApp_Workspace',
   extensions: ['.json', '.md'],
-  strictRepoSandbox: true, // Only allow writing to MyApp_Workspace
+  strictRepoSandbox: true,
 });
 
 const store = new GitRepoStore(auth);
 
-// Mount the drop-in Login Modal (OAuth, Fine-Grained PAT, or Read-Only Username)
 const modal = new GitAuthModal(auth, {
   onSuccess: async (profile) => {
-    console.log(`Logged in as ${profile.username} (${profile.mode})`);
-    const files = await store.fetchAllFiles(); // Map<filename, content>
+    console.log(`Authenticated as ${profile.username} (${profile.mode})`);
   },
 });
 modal.open('#dialogBox');
 
-// Save and read UTF-8 files or JSON objects (automatically tracks GitHub blob SHAs)
-await store.writeFile('notes.md', '# Hello World\nSaved in GitHub!');
-const content = await store.readFile('notes.md');
+await store.writeFile('notes.md', '# Notes\nStored in repository.');
+const text = await store.readFile('notes.md');
+
+// Read public JSON via raw.githubusercontent.com with REST API fallback
+const publicConfig = await store.readPublicJSON('config.json', {
+  owner: 'mk314k',
+  repo: 'MyApp_Workspace',
+});
+
+// Commit multiple file changes in a single Git commit
+await store.commitBatch([
+  { path: 'data/a.json', content: '{"a":1}' },
+  { path: 'data/b.json', content: '{"b":2}' },
+], 'Batch update data files');
 ```
 
-### 2. Structured Relational Tables (`GitTable`)
+### Tables, Vector Search, and Multi-Repo Queries (`GitTable`)
 
 ```typescript
 import { GitTable } from 'octocloud';
 
-const scores = new GitTable<{ id: string; userId: string; score: number }>(store, 'scores', {
-  storageMode: 'sharded',       // Stores each row in tables/scores/rows/<id>.json
-  enforceRowOwnership: true,    // Users can only update/delete their own rows
+interface ClaimRow {
+  id: string;
+  text: string;
+  embedding: number[];
+  updatedAt?: number;
+}
+
+const claims = new GitTable<ClaimRow>(store, 'claims', {
+  storageMode: 'indexed-sharded', // writes tables/claims/rows/<id>.json + tables/claims.index.json
+  enforceRowOwnership: true,
 });
 
-await scores.insert({ id: 'row_1', userId: 'u1', score: 950 });
+await claims.insert({
+  id: 'c1',
+  text: 'Water boils at 100C at standard atmospheric pressure',
+  embedding: [0.91, 0.12, 0.04],
+});
 
-const topScores = await scores.select({
-  where: (r) => r.score >= 500,
-  orderBy: 'score',
-  desc: true,
-  limit: 10,
+// Query across multiple repository owners and rank by cosine similarity
+const matches = await claims.federatedSelect(['alice', 'bob', 'mk314k'], {
+  similarity: {
+    field: 'embedding',
+    vector: [0.9, 0.1, 0.05],
+    threshold: 0.8,
+    topK: 5,
+  },
 });
 ```
 
-### 3. Multiplayer Games (`GitPeerRoom` & Federated `GitRepoRoom`)
+### Client-Side Encrypted Vault and Optimistic Sync Queue (`GitEncryptedStore`, `GitSyncQueue`)
 
 ```typescript
-import { GitPeerRoom, GitRepoRoom } from 'octocloud';
+import { GitEncryptedStore, GitSyncQueue } from 'octocloud';
 
-// Mode A: Real-Time WebRTC P2P Room with Anti-Spoofing Proof
-const p2pRoom = new GitPeerRoom<{ x: number; y: number }>(auth, 'arena-1');
-await p2pRoom.publishIdentityProof(store);
+// PBKDF2-HMAC-SHA256 + AES-GCM-256 encrypted secrets stored in vault/<name>.enc.json
+const vault = new GitEncryptedStore(store);
+await vault.writeSecretJSON('api-keys', { groqKey: 'gsk_...' }, 'passphrase');
+const keys = await vault.readSecretJSON<{ groqKey: string }>('api-keys', 'passphrase');
 
-p2pRoom.onMessage((msg) => {
-  console.log(`[seq #${msg.seq}] ${msg.sender.username} moved to`, msg.payload);
-});
-
-// Mode B: Dual-Repo Turn-Based Match (Zero Shared Tokens!)
-const matchRoom = new GitRepoRoom<{ moves: string[] }>(store, 'chess-match-1');
-await matchRoom.submitMove({ moves: ['e2e4', 'e7e5'] }, 'opponent_github', 'e7e5', ['opponent_github']);
+// Coalesce local writes and flush in a single commitBatch() call
+const syncQueue = new GitSyncQueue(store);
+syncQueue.enqueueJSON('state/draft.json', { step: 1 });
+syncQueue.enqueueJSON('state/draft.json', { step: 2 });
+await syncQueue.flush();
 ```
 
----
+### Hash-Chained Ledger and Peer Consensus (`GitLedger`, `PeerConsensusEngine`)
 
-## Development & Testing
+```typescript
+import { GitLedger, generateLedgerKeyPair, PeerConsensusEngine } from 'octocloud';
+
+const ledger = new GitLedger<{ subjectId: string; outcome: string }>(store, 'audit-log');
+const signer = await generateLedgerKeyPair();
+
+await ledger.append({ subjectId: 'claim_1', outcome: 'fact' }, { signer });
+const verification = await ledger.verifyChain();
+// verification => { valid: true, entryCount: 1, merkleRoot: '...' }
+
+const consensus = new PeerConsensusEngine<'fact' | 'misleading' | 'false'>();
+const { subjects, credibility } = consensus.computeNetworkState([
+  { id: 'v1', subjectId: 'claim_1', voter: 'alice', outcome: 'fact', evidenceUrl: 'https://nasa.gov', timestamp: 1000 },
+  { id: 'v2', subjectId: 'claim_1', voter: 'bob', outcome: 'fact', timestamp: 1100 },
+]);
+```
+
+### Partitioned Page Shards and HTTP Range Reader (`GitPartitionedEngine`, `GitSqliteVfs`)
+
+```typescript
+import { GitPartitionedEngine, GitSqliteVfs } from 'octocloud';
+
+const engine = new GitPartitionedEngine<{ id: string; title: string; vec: number[] }>(store, 'docs', {
+  pageSize: 100,
+  textIndexFields: ['title'],
+  vectorField: 'vec',
+});
+
+await engine.buildFromRows(rows);
+const doc = await engine.getById('doc_42'); // loads manifest.json + 1 page shard
+const results = await engine.searchText('quantum entanglement');
+
+// Read 4KB pages over HTTP Range with an in-memory LRU cache
+const vfs = new GitSqliteVfs('https://example.github.io/data/index.sqlite');
+const header = await vfs.readBytes(0, 100);
+```
+
+### Federated Pub/Sub and Multiplayer (`GitChannel`, `GitPeerRoom`, `GitRepoRoom`)
+
+```typescript
+import { GitChannel, GitPeerRoom, GitRepoRoom } from 'octocloud';
+
+const channel = new GitChannel<{ text: string }>(store, 'lobby');
+await channel.publish('CHAT', { text: 'ready' });
+const { newMessages, presence } = await channel.pollPeers(['peer_username']);
+
+// WebRTC P2P room with signaling exchanged over GitChannel
+const peerRoom = new GitPeerRoom<{ x: number; y: number }>(auth, 'arena-1');
+await channel.negotiateWebRTCPeer(peerRoom, 'peer_username', 'initiator');
+
+// Turn-based match synced across player repositories
+const matchRoom = new GitRepoRoom<{ moves: string[] }>(store, 'chess-1');
+await matchRoom.submitMove({ moves: ['e2e4', 'e7e5'] }, 'peer_username', 'e7e5', ['peer_username']);
+```
+
+## Development
 
 ```bash
 npm install
